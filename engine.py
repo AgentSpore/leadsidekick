@@ -323,3 +323,40 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "total_lists": total_l, "total_templates": total_t,
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
+
+async def list_drafts(
+    db: aiosqlite.Connection,
+    prospect_id: int | None = None,
+    tone: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    q = "SELECT * FROM draft_log WHERE 1=1"
+    params: list = []
+    if prospect_id is not None:
+        q += " AND prospect_id = ?"
+        params.append(prospect_id)
+    if tone:
+        q += " AND tone = ?"
+        params.append(tone)
+    q += f" ORDER BY created_at DESC LIMIT {limit}"
+    rows = await db.execute_fetchall(q, params)
+    return [_draft_log_row(r) for r in rows]
+
+
+async def get_draft(db: aiosqlite.Connection, draft_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM draft_log WHERE id = ?", (draft_id,))
+    return _draft_log_row(rows[0]) if rows else None
+
+
+def _draft_log_row(r: aiosqlite.Row) -> dict:
+    body = r["body"]
+    return {
+        "id": r["id"],
+        "prospect_id": r["prospect_id"],
+        "template_id": r["template_id"],
+        "tone": r["tone"],
+        "subject": r["subject"],
+        "body": body,
+        "word_count": len(body.split()) if body else 0,
+        "created_at": r["created_at"],
+    }
