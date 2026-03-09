@@ -48,6 +48,17 @@ class DraftResponse(BaseModel):
     personalization_signals: list[str]
 
 
+class DraftLogResponse(BaseModel):
+    id: int
+    prospect_id: int
+    template_id: Optional[int]
+    tone: str
+    subject: str
+    body: str
+    word_count: int
+    created_at: str
+
+
 class TemplateCreate(BaseModel):
     name: str
     subject_template: str = Field(..., description="Subject with {{first_name}}, {{company}} placeholders")
