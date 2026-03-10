@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import io
 import re
 from datetime import datetime, timezone
 
@@ -128,7 +130,6 @@ def _render_template(template: str, prospect: dict, value_prop: str, cta: str) -
 
 def generate_draft(prospect: dict, tone: str, context: str | None,
                    value_prop: str, cta: str) -> dict:
-    """Generate a personalised cold email draft from prospect data."""
     first = prospect.get("first_name", "there")
     company = prospect.get("company", "your company")
     job_title = prospect.get("job_title", "")
@@ -159,8 +160,7 @@ def generate_draft(prospect: dict, tone: str, context: str | None,
         "",
         "Best,",
     ]
-    body = "
-".join(body_lines)
+    body = "\n".join(body_lines)
 
     signals = []
     if context:
@@ -178,8 +178,6 @@ def generate_draft(prospect: dict, tone: str, context: str | None,
         "word_count": len(body.split()),
     }
 
-
-# ── CRUD ────────────────────────────────────────────────────────────────────
 
 async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
@@ -244,7 +242,6 @@ async def create_draft(db: aiosqlite.Connection, prospect_id: int, template_id: 
         return {}
     draft = generate_draft(prospect, tone, context, value_prop, cta)
 
-    # Use template if provided
     if template_id:
         rows = await db.execute_fetchall("SELECT * FROM templates WHERE id = ?", (template_id,))
         if rows:
@@ -324,6 +321,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
 
+
 async def list_drafts(
     db: aiosqlite.Connection,
     prospect_id: int | None = None,
@@ -360,3 +358,30 @@ def _draft_log_row(r: aiosqlite.Row) -> dict:
         "word_count": len(body.split()) if body else 0,
         "created_at": r["created_at"],
     }
+
+
+async def search_prospects(db: aiosqlite.Connection, q: str) -> list[dict]:
+    pattern = f"%{q}%"
+    rows = await db.execute_fetchall(
+        """SELECT * FROM prospects
+           WHERE first_name LIKE ? OR last_name LIKE ? OR email LIKE ?
+              OR company LIKE ? OR job_title LIKE ?
+           ORDER BY created_at DESC LIMIT 100""",
+        (pattern, pattern, pattern, pattern, pattern)
+    )
+    return [_prospect_row(r) for r in rows]
+
+
+async def export_prospects_csv(db: aiosqlite.Connection,
+                                list_id: int | None = None,
+                                status: str | None = None) -> str:
+    rows = await list_prospects(db, list_id, status)
+    buf = io.StringIO()
+    fieldnames = ["id", "first_name", "last_name", "email", "company",
+                  "job_title", "website", "linkedin_url", "notes",
+                  "list_id", "status", "created_at"]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: r.get(k, "") for k in fieldnames})
+    return buf.getvalue()
