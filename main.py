@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 from models import (
     ProspectCreate, ProspectResponse,
@@ -17,6 +18,7 @@ from engine import (
     bulk_import_prospects, create_draft, list_drafts, get_draft,
     create_template, list_templates,
     create_prospect_list, list_prospect_lists, get_stats,
+    search_prospects, export_prospects_csv,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -32,7 +34,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LeadSidekick",
     description="Lead prospecting + personalised cold outreach drafter. Find prospects, generate tailored emails in seconds.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -40,7 +42,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 # ── Prospect Lists ────────────────────────────────────────────────────────
@@ -68,6 +70,26 @@ async def bulk_import(body: BulkImportRequest):
         app.state.db,
         [p.model_dump() for p in body.prospects],
         body.list_id,
+    )
+
+
+# search and export/csv BEFORE /{prospect_id} to avoid route conflicts
+@app.get("/prospects/search", response_model=list[ProspectResponse])
+async def search(q: str = Query(..., min_length=2, description="Search term (min 2 chars)")):
+    """Full-text search across first_name, last_name, email, company, job_title."""
+    return await search_prospects(app.state.db, q)
+
+
+@app.get("/prospects/export/csv")
+async def export_csv(
+    list_id: int | None = Query(None, description="Filter by list"),
+    status: str | None = Query(None, description="new | emailed | replied | converted | unsubscribed"),
+):
+    """Export matching prospects as a CSV file for use in CRM or outreach tools."""
+    data = await export_prospects_csv(app.state.db, list_id, status)
+    return StreamingResponse(
+        iter([data]), media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=prospects.csv"}
     )
 
 
@@ -113,20 +135,15 @@ async def generate_draft(body: DraftRequest):
 
 @app.get("/drafts", response_model=list[DraftLogResponse])
 async def list_draft_history(
-    prospect_id: int | None = Query(None, description="Filter by prospect ID"),
-    tone: str | None = Query(None, description="Filter: professional | friendly | direct | witty"),
+    prospect_id: int | None = Query(None),
+    tone: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """
-    List previously generated email drafts.
-    Useful for reviewing outreach history, auditing tone usage, and avoiding duplicate sends.
-    """
     return await list_drafts(app.state.db, prospect_id, tone, limit)
 
 
 @app.get("/drafts/{draft_id}", response_model=DraftLogResponse)
 async def get_draft_detail(draft_id: int):
-    """Get a single draft by ID — full subject, body, and metadata."""
     d = await get_draft(app.state.db, draft_id)
     if not d:
         raise HTTPException(404, "Draft not found")
