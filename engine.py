@@ -1,8 +1,9 @@
 from __future__ import annotations
 import csv
 import io
+import json as jsonlib
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import aiosqlite
 
@@ -56,6 +57,26 @@ CREATE TABLE IF NOT EXISTS usage_stats (
     total_drafts INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS sequences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    value_prop TEXT NOT NULL,
+    cta TEXT NOT NULL DEFAULT 'book a 15-min call',
+    steps TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS enrollments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_id INTEGER NOT NULL REFERENCES sequences(id),
+    prospect_id INTEGER NOT NULL REFERENCES prospects(id),
+    current_step INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    enrolled_at TEXT NOT NULL,
+    last_advanced_at TEXT,
+    UNIQUE(sequence_id, prospect_id)
+);
+
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
 
@@ -83,6 +104,13 @@ TONE_CLOSES = {
     "friendly": "Would love to chat — even 10 minutes would be great!",
     "direct": "Worth a quick chat?",
     "witty": "If this resonated even 10%, let's talk.",
+}
+
+FOLLOWUP_OPENERS = {
+    "professional": "Following up on my earlier note — I know inboxes get busy.",
+    "friendly": "Hey again! Just bumping this up in case it got buried.",
+    "direct": "Circling back briefly.",
+    "witty": "My last email was so good it deserved a sequel.",
 }
 
 
@@ -179,6 +207,33 @@ def generate_draft(prospect: dict, tone: str, context: str | None,
     }
 
 
+def generate_followup_draft(prospect: dict, tone: str, step_num: int,
+                             subject_hint: str, value_prop: str, cta: str) -> dict:
+    first = prospect.get("first_name", "there")
+    company = prospect.get("company", "your company")
+    opener = FOLLOWUP_OPENERS.get(tone, FOLLOWUP_OPENERS["professional"])
+    close_line = TONE_CLOSES.get(tone, TONE_CLOSES["professional"])
+
+    subject = f"Re: {subject_hint}"
+    body_lines = [
+        f"Hi {first},",
+        "",
+        opener,
+        "",
+        f"{value_prop}",
+        "",
+        f"Would you be open to {cta}? {close_line}",
+        "",
+        "Best,",
+    ]
+    body = "\n".join(body_lines)
+    return {
+        "subject": subject,
+        "body": body,
+        "word_count": len(body.split()),
+    }
+
+
 async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cur = await db.execute(
@@ -252,13 +307,13 @@ async def create_draft(db: aiosqlite.Connection, prospect_id: int, template_id: 
             await db.execute("UPDATE templates SET times_used = times_used + 1 WHERE id = ?", (template_id,))
 
     now = datetime.now(timezone.utc).isoformat()
-    await db.execute(
+    cur = await db.execute(
         "INSERT INTO draft_log (prospect_id, template_id, tone, subject, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (prospect_id, template_id, tone, draft["subject"], draft["body"], now)
     )
     await db.execute("UPDATE usage_stats SET total_drafts = total_drafts + 1 WHERE id = 1")
     await db.commit()
-    return {"prospect_id": prospect_id, **draft, "tone": tone}
+    return {"prospect_id": prospect_id, **draft, "tone": tone, "draft_id": cur.lastrowid}
 
 
 async def create_template(db: aiosqlite.Connection, data: dict) -> dict:
@@ -309,6 +364,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     total_p = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM prospects"))[0]["cnt"]
     total_l = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM prospect_lists"))[0]["cnt"]
     total_t = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM templates"))[0]["cnt"]
+    total_s = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM sequences"))[0]["cnt"]
     stats_row = await db.execute_fetchall("SELECT * FROM usage_stats WHERE id = 1")
     total_drafts = stats_row[0]["total_drafts"] if stats_row else 0
     status_rows = await db.execute_fetchall("SELECT status, COUNT(*) as cnt FROM prospects GROUP BY status")
@@ -318,24 +374,19 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     return {
         "total_prospects": total_p, "total_drafts_generated": total_drafts,
         "total_lists": total_l, "total_templates": total_t,
+        "total_sequences": total_s,
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
 
 
-async def list_drafts(
-    db: aiosqlite.Connection,
-    prospect_id: int | None = None,
-    tone: str | None = None,
-    limit: int = 50,
-) -> list[dict]:
+async def list_drafts(db: aiosqlite.Connection, prospect_id: int | None = None,
+                       tone: str | None = None, limit: int = 50) -> list[dict]:
     q = "SELECT * FROM draft_log WHERE 1=1"
     params: list = []
     if prospect_id is not None:
-        q += " AND prospect_id = ?"
-        params.append(prospect_id)
+        q += " AND prospect_id = ?"; params.append(prospect_id)
     if tone:
-        q += " AND tone = ?"
-        params.append(tone)
+        q += " AND tone = ?"; params.append(tone)
     q += f" ORDER BY created_at DESC LIMIT {limit}"
     rows = await db.execute_fetchall(q, params)
     return [_draft_log_row(r) for r in rows]
@@ -349,12 +400,9 @@ async def get_draft(db: aiosqlite.Connection, draft_id: int) -> dict | None:
 def _draft_log_row(r: aiosqlite.Row) -> dict:
     body = r["body"]
     return {
-        "id": r["id"],
-        "prospect_id": r["prospect_id"],
-        "template_id": r["template_id"],
-        "tone": r["tone"],
-        "subject": r["subject"],
-        "body": body,
+        "id": r["id"], "prospect_id": r["prospect_id"],
+        "template_id": r["template_id"], "tone": r["tone"],
+        "subject": r["subject"], "body": body,
         "word_count": len(body.split()) if body else 0,
         "created_at": r["created_at"],
     }
@@ -385,3 +433,168 @@ async def export_prospects_csv(db: aiosqlite.Connection,
     for r in rows:
         writer.writerow({k: r.get(k, "") for k in fieldnames})
     return buf.getvalue()
+
+
+# ── Sequences ─────────────────────────────────────────────────────────────
+
+async def create_sequence(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    steps_json = jsonlib.dumps(data["steps"])
+    cur = await db.execute(
+        "INSERT INTO sequences (name, value_prop, cta, steps, created_at) VALUES (?,?,?,?,?)",
+        (data["name"], data["value_prop"], data.get("cta", "book a 15-min call"), steps_json, now),
+    )
+    await db.commit()
+    return await _get_sequence(db, cur.lastrowid)
+
+
+async def list_sequences(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM sequences ORDER BY created_at DESC")
+    result = []
+    for r in rows:
+        enrolled = (await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM enrollments WHERE sequence_id=?", (r["id"],)))[0]["c"]
+        result.append({
+            "id": r["id"], "name": r["name"], "value_prop": r["value_prop"],
+            "cta": r["cta"], "steps": jsonlib.loads(r["steps"]),
+            "total_enrolled": enrolled, "created_at": r["created_at"],
+        })
+    return result
+
+
+async def _get_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM sequences WHERE id=?", (seq_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    enrolled = (await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM enrollments WHERE sequence_id=?", (seq_id,)))[0]["c"]
+    return {
+        "id": r["id"], "name": r["name"], "value_prop": r["value_prop"],
+        "cta": r["cta"], "steps": jsonlib.loads(r["steps"]),
+        "total_enrolled": enrolled, "created_at": r["created_at"],
+    }
+
+
+async def enroll_prospect(db: aiosqlite.Connection, seq_id: int, prospect_id: int) -> dict | str | None:
+    seq = await _get_sequence(db, seq_id)
+    if not seq:
+        return None
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return "prospect_not_found"
+    existing = await db.execute_fetchall(
+        "SELECT id FROM enrollments WHERE sequence_id=? AND prospect_id=?", (seq_id, prospect_id))
+    if existing:
+        return "already_enrolled"
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO enrollments (sequence_id, prospect_id, current_step, status, enrolled_at) VALUES (?,?,0,'active',?)",
+        (seq_id, prospect_id, now),
+    )
+    await db.commit()
+    return await _get_enrollment(db, cur.lastrowid, seq)
+
+
+async def list_enrollments(db: aiosqlite.Connection, seq_id: int) -> list[dict]:
+    seq = await _get_sequence(db, seq_id)
+    if not seq:
+        return []
+    rows = await db.execute_fetchall(
+        "SELECT * FROM enrollments WHERE sequence_id=? ORDER BY enrolled_at DESC", (seq_id,))
+    result = []
+    for r in rows:
+        prospect = await get_prospect(db, r["prospect_id"])
+        result.append({
+            "id": r["id"], "sequence_id": r["sequence_id"],
+            "prospect_id": r["prospect_id"],
+            "prospect_name": f"{prospect['first_name']} {prospect['last_name']}" if prospect else "unknown",
+            "prospect_email": prospect["email"] if prospect else "",
+            "current_step": r["current_step"],
+            "total_steps": len(seq["steps"]),
+            "status": r["status"],
+            "enrolled_at": r["enrolled_at"],
+            "last_advanced_at": r["last_advanced_at"],
+        })
+    return result
+
+
+async def _get_enrollment(db: aiosqlite.Connection, enroll_id: int, seq: dict) -> dict:
+    rows = await db.execute_fetchall("SELECT * FROM enrollments WHERE id=?", (enroll_id,))
+    r = rows[0]
+    prospect = await get_prospect(db, r["prospect_id"])
+    return {
+        "id": r["id"], "sequence_id": r["sequence_id"],
+        "prospect_id": r["prospect_id"],
+        "prospect_name": f"{prospect['first_name']} {prospect['last_name']}" if prospect else "unknown",
+        "prospect_email": prospect["email"] if prospect else "",
+        "current_step": r["current_step"],
+        "total_steps": len(seq["steps"]),
+        "status": r["status"],
+        "enrolled_at": r["enrolled_at"],
+        "last_advanced_at": r["last_advanced_at"],
+    }
+
+
+async def advance_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None:
+    seq = await _get_sequence(db, seq_id)
+    if not seq:
+        return None
+    steps = seq["steps"]
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    rows = await db.execute_fetchall(
+        "SELECT * FROM enrollments WHERE sequence_id=? AND status='active'", (seq_id,))
+
+    advanced = 0
+    already_complete = 0
+    not_due = 0
+    drafts_generated = []
+
+    for r in rows:
+        step_idx = r["current_step"]
+        if step_idx >= len(steps):
+            await db.execute("UPDATE enrollments SET status='completed' WHERE id=?", (r["id"],))
+            already_complete += 1
+            continue
+
+        step = steps[step_idx]
+        ref_time = r["last_advanced_at"] or r["enrolled_at"]
+        ref_dt = datetime.fromisoformat(ref_time)
+        delay = timedelta(days=step["delay_days"])
+
+        if now < ref_dt + delay:
+            not_due += 1
+            continue
+
+        prospect = await get_prospect(db, r["prospect_id"])
+        if not prospect:
+            continue
+
+        draft = generate_followup_draft(
+            prospect, step["tone"], step_idx,
+            step["subject_hint"], seq["value_prop"], seq["cta"],
+        )
+        cur = await db.execute(
+            "INSERT INTO draft_log (prospect_id, template_id, tone, subject, body, created_at) VALUES (?,?,?,?,?,?)",
+            (r["prospect_id"], None, step["tone"], draft["subject"], draft["body"], now_iso),
+        )
+        await db.execute("UPDATE usage_stats SET total_drafts = total_drafts + 1 WHERE id = 1")
+        drafts_generated.append(cur.lastrowid)
+
+        next_step = step_idx + 1
+        new_status = "completed" if next_step >= len(steps) else "active"
+        await db.execute(
+            "UPDATE enrollments SET current_step=?, status=?, last_advanced_at=? WHERE id=?",
+            (next_step, new_status, now_iso, r["id"]),
+        )
+        advanced += 1
+
+    await db.commit()
+    return {
+        "advanced": advanced,
+        "already_complete": already_complete,
+        "not_due": not_due,
+        "drafts_generated": drafts_generated,
+    }
