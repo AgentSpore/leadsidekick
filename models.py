@@ -101,5 +101,49 @@ class UsageStats(BaseModel):
     total_drafts_generated: int
     total_lists: int
     total_templates: int
+    total_sequences: int
     by_status: dict
     most_used_tone: Optional[str]
+
+
+class SequenceStep(BaseModel):
+    delay_days: int = Field(ge=0, le=90, description="Days to wait before sending this step")
+    tone: str = Field("professional", description="professional | friendly | direct | witty")
+    subject_hint: str = Field(..., min_length=1, max_length=200, description="Subject line hint for this step")
+
+
+class SequenceCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    value_prop: str = Field(..., description="Value proposition used in all steps")
+    cta: str = Field("book a 15-min call", description="Call to action")
+    steps: list[SequenceStep] = Field(min_length=1, max_length=10)
+
+
+class SequenceResponse(BaseModel):
+    id: int
+    name: str
+    value_prop: str
+    cta: str
+    steps: list[SequenceStep]
+    total_enrolled: int
+    created_at: str
+
+
+class EnrollmentResponse(BaseModel):
+    id: int
+    sequence_id: int
+    prospect_id: int
+    prospect_name: str
+    prospect_email: str
+    current_step: int
+    total_steps: int
+    status: str
+    enrolled_at: str
+    last_advanced_at: Optional[str]
+
+
+class AdvanceResult(BaseModel):
+    advanced: int
+    already_complete: int
+    not_due: int
+    drafts_generated: list[int]

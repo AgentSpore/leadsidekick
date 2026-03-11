@@ -12,6 +12,8 @@ from models import (
     TemplateCreate, TemplateResponse,
     ProspectListCreate, ProspectListResponse,
     BulkImportRequest, UsageStats,
+    SequenceCreate, SequenceResponse,
+    EnrollmentResponse, AdvanceResult,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -19,6 +21,8 @@ from engine import (
     create_template, list_templates,
     create_prospect_list, list_prospect_lists, get_stats,
     search_prospects, export_prospects_csv,
+    create_sequence, list_sequences, enroll_prospect,
+    list_enrollments, advance_sequence,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -34,7 +38,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LeadSidekick",
     description="Lead prospecting + personalised cold outreach drafter. Find prospects, generate tailored emails in seconds.",
-    version="0.3.0",
+    version="0.4.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -42,10 +46,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.4.0"}
 
 
-# ── Prospect Lists ────────────────────────────────────────────────────────
+# ── Prospect Lists ────────────────────────────────────────────────
 
 @app.post("/lists", response_model=ProspectListResponse, status_code=201)
 async def create_list(body: ProspectListCreate):
@@ -57,7 +61,7 @@ async def get_lists():
     return await list_prospect_lists(app.state.db)
 
 
-# ── Prospects ─────────────────────────────────────────────────────────────
+# ── Prospects ─────────────────────────────────────────────────────
 
 @app.post("/prospects", response_model=ProspectResponse, status_code=201)
 async def add_prospect(body: ProspectCreate):
@@ -117,7 +121,7 @@ async def patch_status(prospect_id: int, status: str = Query(...)):
     return p
 
 
-# ── Draft Generation ──────────────────────────────────────────────────────
+# ── Draft Generation ──────────────────────────────────────────────
 
 @app.post("/draft", response_model=DraftResponse)
 async def generate_draft(body: DraftRequest):
@@ -150,7 +154,7 @@ async def get_draft_detail(draft_id: int):
     return d
 
 
-# ── Templates ─────────────────────────────────────────────────────────────
+# ── Templates ─────────────────────────────────────────────────────
 
 @app.post("/templates", response_model=TemplateResponse, status_code=201)
 async def add_template(body: TemplateCreate):
@@ -162,7 +166,43 @@ async def get_templates():
     return await list_templates(app.state.db)
 
 
-# ── Stats ─────────────────────────────────────────────────────────────────
+# ── Sequences ─────────────────────────────────────────────────────
+
+@app.post("/sequences", response_model=SequenceResponse, status_code=201)
+async def add_sequence(body: SequenceCreate):
+    return await create_sequence(app.state.db, body.model_dump())
+
+
+@app.get("/sequences", response_model=list[SequenceResponse])
+async def get_sequences():
+    return await list_sequences(app.state.db)
+
+
+@app.post("/sequences/{sequence_id}/enroll/{prospect_id}", response_model=EnrollmentResponse, status_code=201)
+async def enroll(sequence_id: int, prospect_id: int):
+    p = await get_prospect(app.state.db, prospect_id)
+    if not p:
+        raise HTTPException(404, "Prospect not found")
+    result = await enroll_prospect(app.state.db, sequence_id, prospect_id)
+    if not result:
+        raise HTTPException(409, "Prospect already enrolled in this sequence")
+    return result
+
+
+@app.get("/sequences/{sequence_id}/enrollments", response_model=list[EnrollmentResponse])
+async def get_enrollments(sequence_id: int):
+    return await list_enrollments(app.state.db, sequence_id)
+
+
+@app.post("/sequences/{sequence_id}/advance", response_model=AdvanceResult)
+async def advance(sequence_id: int):
+    result = await advance_sequence(app.state.db, sequence_id)
+    if result is None:
+        raise HTTPException(404, "Sequence not found")
+    return result
+
+
+# ── Stats ─────────────────────────────────────────────────────────
 
 @app.get("/stats", response_model=UsageStats)
 async def stats():
