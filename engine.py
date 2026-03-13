@@ -77,6 +77,19 @@ CREATE TABLE IF NOT EXISTS enrollments (
     UNIQUE(sequence_id, prospect_id)
 );
 
+CREATE TABLE IF NOT EXISTS campaign_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prospect_id INTEGER NOT NULL REFERENCES prospects(id),
+    sequence_id INTEGER,
+    draft_id INTEGER,
+    event_type TEXT NOT NULL,
+    metadata TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_prospect ON campaign_events(prospect_id);
+CREATE INDEX IF NOT EXISTS idx_events_sequence ON campaign_events(sequence_id);
+
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
 
@@ -118,6 +131,11 @@ async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
     await db.executescript(SQL)
+    # Migration: add tags column if missing
+    try:
+        await db.execute("SELECT tags FROM prospects LIMIT 1")
+    except Exception:
+        await db.execute("ALTER TABLE prospects ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
     await db.commit()
     return db
 
@@ -128,6 +146,7 @@ def _prospect_row(r: aiosqlite.Row) -> dict:
         "email": r["email"], "company": r["company"], "job_title": r["job_title"],
         "website": r["website"], "linkedin_url": r["linkedin_url"],
         "notes": r["notes"], "list_id": r["list_id"],
+        "tags": jsonlib.loads(r["tags"]) if r["tags"] else [],
         "status": r["status"], "created_at": r["created_at"],
     }
 
@@ -236,13 +255,14 @@ def generate_followup_draft(prospect: dict, tone: str, step_num: int,
 
 async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
+    tags_json = jsonlib.dumps(data.get("tags", []))
     cur = await db.execute(
         """INSERT INTO prospects (first_name, last_name, email, company, job_title, website,
-           linkedin_url, notes, list_id, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)""",
+           linkedin_url, notes, list_id, tags, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)""",
         (data["first_name"], data["last_name"], data["email"], data["company"],
          data.get("job_title"), data.get("website"), data.get("linkedin_url"),
-         data.get("notes"), data.get("list_id"), now)
+         data.get("notes"), data.get("list_id"), tags_json, now)
     )
     await db.commit()
     rows = await db.execute_fetchall("SELECT * FROM prospects WHERE id = ?", (cur.lastrowid,))
@@ -250,13 +270,15 @@ async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict:
 
 
 async def list_prospects(db: aiosqlite.Connection, list_id: int | None = None,
-                         status: str | None = None) -> list[dict]:
+                         status: str | None = None, tag: str | None = None) -> list[dict]:
     q, params = "SELECT * FROM prospects", []
     conds = []
     if list_id is not None:
         conds.append("list_id = ?"); params.append(list_id)
     if status:
         conds.append("status = ?"); params.append(status)
+    if tag:
+        conds.append("tags LIKE ?"); params.append(f'%"{tag}"%')
     if conds:
         q += " WHERE " + " AND ".join(conds)
     q += " ORDER BY created_at DESC"
@@ -597,4 +619,106 @@ async def advance_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None
         "already_complete": already_complete,
         "not_due": not_due,
         "drafts_generated": drafts_generated,
+    }
+
+
+
+# ── Tags ─────────────────────────────────────────────────────────────────
+
+async def add_prospect_tag(db: aiosqlite.Connection, prospect_id: int, tag: str) -> dict | None:
+    rows = await db.execute_fetchall("SELECT tags FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return None
+    current = jsonlib.loads(rows[0]["tags"]) if rows[0]["tags"] else []
+    tag = tag.strip().lower()
+    if tag not in current:
+        current.append(tag)
+        await db.execute("UPDATE prospects SET tags = ? WHERE id = ?", (jsonlib.dumps(current), prospect_id))
+        await db.commit()
+    return await get_prospect(db, prospect_id)
+
+
+async def remove_prospect_tag(db: aiosqlite.Connection, prospect_id: int, tag: str) -> dict | None:
+    rows = await db.execute_fetchall("SELECT tags FROM prospects WHERE id = ?", (prospect_id,))
+    if not rows:
+        return None
+    current = jsonlib.loads(rows[0]["tags"]) if rows[0]["tags"] else []
+    tag = tag.strip().lower()
+    if tag in current:
+        current.remove(tag)
+        await db.execute("UPDATE prospects SET tags = ? WHERE id = ?", (jsonlib.dumps(current), prospect_id))
+        await db.commit()
+    return await get_prospect(db, prospect_id)
+
+
+# ── Campaign Events ──────────────────────────────────────────────────────
+
+async def record_event(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO campaign_events (prospect_id, sequence_id, draft_id, event_type, metadata, created_at) VALUES (?,?,?,?,?,?)",
+        (data["prospect_id"], data.get("sequence_id"), data.get("draft_id"),
+         data["event_type"], jsonlib.dumps(data.get("metadata")) if data.get("metadata") else None, now),
+    )
+    await db.commit()
+    return {"id": cur.lastrowid, "event_type": data["event_type"], "created_at": now}
+
+
+async def get_sequence_analytics(db: aiosqlite.Connection, seq_id: int) -> dict | None:
+    seq = await _get_sequence(db, seq_id)
+    if not seq:
+        return None
+    enrolled = (await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM enrollments WHERE sequence_id=?", (seq_id,)))[0]["c"]
+    completed = (await db.execute_fetchall(
+        "SELECT COUNT(*) as c FROM enrollments WHERE sequence_id=? AND status='completed'", (seq_id,)))[0]["c"]
+    event_rows = await db.execute_fetchall(
+        "SELECT event_type, COUNT(*) as cnt FROM campaign_events WHERE sequence_id=? GROUP BY event_type",
+        (seq_id,),
+    )
+    events = {r["event_type"]: r["cnt"] for r in event_rows}
+    sent = events.get("sent", 0)
+    opened = events.get("opened", 0)
+    replied = events.get("replied", 0)
+    bounced = events.get("bounced", 0)
+    return {
+        "sequence_id": seq_id,
+        "sequence_name": seq["name"],
+        "total_enrolled": enrolled,
+        "completed": completed,
+        "events": events,
+        "sent": sent,
+        "opened": opened,
+        "replied": replied,
+        "bounced": bounced,
+        "open_rate": round(opened / max(sent, 1) * 100, 1),
+        "reply_rate": round(replied / max(sent, 1) * 100, 1),
+        "bounce_rate": round(bounced / max(sent, 1) * 100, 1),
+    }
+
+
+async def get_campaign_overview(db: aiosqlite.Connection) -> dict:
+    total_events = (await db.execute_fetchall("SELECT COUNT(*) as c FROM campaign_events"))[0]["c"]
+    event_rows = await db.execute_fetchall(
+        "SELECT event_type, COUNT(*) as cnt FROM campaign_events GROUP BY event_type"
+    )
+    by_type = {r["event_type"]: r["cnt"] for r in event_rows}
+    sent = by_type.get("sent", 0)
+    opened = by_type.get("opened", 0)
+    replied = by_type.get("replied", 0)
+    seq_rows = await db.execute_fetchall(
+        """SELECT s.id, s.name, COUNT(e.id) as event_count
+           FROM sequences s LEFT JOIN campaign_events e ON s.id = e.sequence_id
+           GROUP BY s.id ORDER BY event_count DESC LIMIT 5"""
+    )
+    top_sequences = [{"id": r["id"], "name": r["name"], "events": r["event_count"]} for r in seq_rows]
+    return {
+        "total_events": total_events,
+        "by_type": by_type,
+        "sent": sent,
+        "opened": opened,
+        "replied": replied,
+        "overall_open_rate": round(opened / max(sent, 1) * 100, 1),
+        "overall_reply_rate": round(replied / max(sent, 1) * 100, 1),
+        "top_sequences": top_sequences,
     }

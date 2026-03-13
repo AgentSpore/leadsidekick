@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LeadSidekick",
     description="Lead prospecting + personalised cold outreach drafter. Find prospects, generate tailored emails in seconds.",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -46,7 +46,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
 
 
 # ── Prospect Lists ────────────────────────────────────────────────
@@ -207,3 +207,42 @@ async def advance(sequence_id: int):
 @app.get("/stats", response_model=UsageStats)
 async def stats():
     return await get_stats(app.state.db)
+
+
+
+# ── Tags ─────────────────────────────────────────────────────────────────
+
+@app.post("/prospects/{prospect_id}/tags", response_model=ProspectResponse)
+async def tag_prospect(prospect_id: int, tag: str = Query(..., min_length=1, max_length=50)):
+    result = await add_prospect_tag(app.state.db, prospect_id, tag)
+    if not result:
+        raise HTTPException(404, "Prospect not found")
+    return result
+
+
+@app.delete("/prospects/{prospect_id}/tags", response_model=ProspectResponse)
+async def untag_prospect(prospect_id: int, tag: str = Query(..., min_length=1, max_length=50)):
+    result = await remove_prospect_tag(app.state.db, prospect_id, tag)
+    if not result:
+        raise HTTPException(404, "Prospect not found")
+    return result
+
+
+# ── Campaign Analytics ───────────────────────────────────────────────────
+
+@app.post("/events", status_code=201)
+async def create_event(body: CampaignEventCreate):
+    return await record_event(app.state.db, body.model_dump())
+
+
+@app.get("/sequences/{sequence_id}/analytics", response_model=SequenceAnalytics)
+async def sequence_analytics(sequence_id: int):
+    result = await get_sequence_analytics(app.state.db, sequence_id)
+    if not result:
+        raise HTTPException(404, "Sequence not found")
+    return result
+
+
+@app.get("/analytics/campaigns", response_model=CampaignOverview)
+async def campaign_overview():
+    return await get_campaign_overview(app.state.db)
