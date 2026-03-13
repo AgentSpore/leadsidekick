@@ -25,6 +25,9 @@ from models import (
     ProspectNoteCreate, ProspectNoteResponse,
     SnippetCreate, SnippetResponse,
     OutreachCalendar,
+    ABTestCreate, ABTestResponse, ABTestAssignment, ABTestComplete, ABTestAssignmentResponse,
+    SegmentCreate, SegmentUpdate, SegmentResponse, SegmentProspectEntry,
+    AutomationRuleCreate, AutomationRuleUpdate, AutomationRuleResponse, AutomationEvaluateRequest,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -48,6 +51,16 @@ from engine import (
     add_prospect_note, list_prospect_notes, delete_prospect_note, toggle_pin_note,
     create_snippet, list_snippets, get_snippet, delete_snippet, increment_snippet_usage,
     get_outreach_calendar,
+    # v1.0.0: A/B Testing
+    create_ab_test, list_ab_tests, get_ab_test,
+    assign_prospect_to_test, complete_ab_test, list_test_assignments,
+    # v1.0.0: Segments
+    create_segment, list_segments, get_segment, update_segment, delete_segment,
+    evaluate_segment, list_segment_prospects, auto_assign_segments,
+    # v1.0.0: Automation Rules
+    create_automation_rule, list_automation_rules, get_automation_rule,
+    update_automation_rule, delete_automation_rule,
+    evaluate_automation_for_prospect,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -68,9 +81,10 @@ app = FastAPI(
         "lead scoring, pipeline tracking, tone A/B testing, prospect activity log, "
         "sequence cloning, do-not-contact list, smart lists (saved filters), "
         "prospect deduplication with merge, threaded prospect notes with pinning, "
-        "reusable email snippets, and outreach calendar view."
+        "reusable email snippets, outreach calendar view, email A/B split-testing, "
+        "dynamic prospect segments, and trigger-based outreach automation rules."
     ),
-    version="0.9.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -78,7 +92,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.9.0"}
+    return {"status": "ok", "version": "1.0.0"}
 
 
 # ── Smart Lists ─────────────────────────────────────────────────────────
@@ -570,3 +584,190 @@ async def outreach_calendar(
     if from_date > to_date:
         raise HTTPException(422, "from_date must be <= to_date")
     return await get_outreach_calendar(app.state.db, from_date, to_date)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 1: Email A/B Testing (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/ab-tests", response_model=ABTestResponse, status_code=201)
+async def create_ab_test_endpoint(body: ABTestCreate):
+    """Create a new A/B test to split-test subject lines and tones."""
+    return await create_ab_test(app.state.db, body.model_dump())
+
+
+@app.get("/ab-tests", response_model=list[ABTestResponse])
+async def list_ab_tests_endpoint(
+    status: str | None = Query(None, description="running | completed"),
+):
+    """List all A/B tests, optionally filtered by status."""
+    return await list_ab_tests(app.state.db, status)
+
+
+@app.get("/ab-tests/{test_id}", response_model=ABTestResponse)
+async def get_ab_test_endpoint(test_id: int):
+    """Get A/B test details with computed variant stats."""
+    result = await get_ab_test(app.state.db, test_id)
+    if not result:
+        raise HTTPException(404, "A/B test not found")
+    return result
+
+
+@app.post("/ab-tests/{test_id}/assign", response_model=ABTestAssignmentResponse, status_code=201)
+async def assign_to_test(test_id: int, body: ABTestAssignment):
+    """Assign a prospect to an A/B test variant. Auto round-robin if variant omitted."""
+    result = await assign_prospect_to_test(
+        app.state.db, test_id, body.prospect_id, body.variant,
+    )
+    if result is None:
+        raise HTTPException(404, "A/B test not found")
+    if result == "test_not_running":
+        raise HTTPException(422, "Test is not running")
+    if result == "prospect_not_found":
+        raise HTTPException(404, "Prospect not found")
+    if result == "dnc_blocked":
+        raise HTTPException(422, "Prospect is on the do-not-contact list")
+    if result == "already_assigned":
+        raise HTTPException(409, "Prospect already assigned to this test")
+    if result == "invalid_variant":
+        raise HTTPException(422, "Variant must be 'a' or 'b'")
+    return result
+
+
+@app.get("/ab-tests/{test_id}/assignments", response_model=list[ABTestAssignmentResponse])
+async def get_test_assignments(test_id: int):
+    """List all prospect assignments for an A/B test."""
+    result = await list_test_assignments(app.state.db, test_id)
+    if result is None:
+        raise HTTPException(404, "A/B test not found")
+    return result
+
+
+@app.post("/ab-tests/{test_id}/complete", response_model=ABTestResponse)
+async def complete_test(test_id: int, body: ABTestComplete):
+    """Complete an A/B test. Auto-determines winner by reply_rate if not specified."""
+    result = await complete_ab_test(app.state.db, test_id, body.winner)
+    if result is None:
+        raise HTTPException(404, "A/B test not found")
+    if result == "test_not_running":
+        raise HTTPException(422, "Test is not running")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 2: Prospect Segments (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/segments", response_model=SegmentResponse, status_code=201)
+async def create_segment_endpoint(body: SegmentCreate):
+    """Create a dynamic segment based on criteria (score range, engagement, status, tags, etc.)."""
+    return await create_segment(app.state.db, body.model_dump())
+
+
+@app.get("/segments", response_model=list[SegmentResponse])
+async def list_segments_endpoint():
+    """List all segments with their prospect counts."""
+    return await list_segments(app.state.db)
+
+
+@app.get("/segments/{segment_id}", response_model=SegmentResponse)
+async def get_segment_endpoint(segment_id: int):
+    result = await get_segment(app.state.db, segment_id)
+    if not result:
+        raise HTTPException(404, "Segment not found")
+    return result
+
+
+@app.patch("/segments/{segment_id}", response_model=SegmentResponse)
+async def update_segment_endpoint(segment_id: int, body: SegmentUpdate):
+    """Update a segment's name, description, criteria, or auto_assign flag."""
+    result = await update_segment(app.state.db, segment_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Segment not found")
+    return result
+
+
+@app.delete("/segments/{segment_id}", status_code=204)
+async def delete_segment_endpoint(segment_id: int):
+    if not await delete_segment(app.state.db, segment_id):
+        raise HTTPException(404, "Segment not found")
+
+
+@app.post("/segments/{segment_id}/evaluate", response_model=SegmentResponse)
+async def evaluate_segment_endpoint(segment_id: int):
+    """Re-evaluate a segment: recompute matching prospects and update prospect_count."""
+    result = await evaluate_segment(app.state.db, segment_id)
+    if not result:
+        raise HTTPException(404, "Segment not found")
+    return result
+
+
+@app.get("/segments/{segment_id}/prospects", response_model=list[SegmentProspectEntry])
+async def segment_prospects_endpoint(segment_id: int):
+    """Get all prospects matching this segment's criteria with their scores."""
+    result = await list_segment_prospects(app.state.db, segment_id)
+    if result is None:
+        raise HTTPException(404, "Segment not found")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 3: Outreach Automation Rules (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/automations", response_model=AutomationRuleResponse, status_code=201)
+async def create_automation_endpoint(body: AutomationRuleCreate):
+    """Create a trigger-based automation rule."""
+    from models import VALID_TRIGGER_TYPES, VALID_ACTION_TYPES
+    if body.trigger_type not in VALID_TRIGGER_TYPES:
+        raise HTTPException(422, f"Invalid trigger_type. Must be one of: {', '.join(sorted(VALID_TRIGGER_TYPES))}")
+    if body.action_type not in VALID_ACTION_TYPES:
+        raise HTTPException(422, f"Invalid action_type. Must be one of: {', '.join(sorted(VALID_ACTION_TYPES))}")
+    return await create_automation_rule(app.state.db, body.model_dump())
+
+
+@app.get("/automations", response_model=list[AutomationRuleResponse])
+async def list_automations_endpoint(
+    enabled: bool | None = Query(None, description="Filter by enabled state"),
+    trigger_type: str | None = Query(None, description="Filter by trigger type"),
+):
+    """List automation rules with optional filters."""
+    return await list_automation_rules(app.state.db, enabled, trigger_type)
+
+
+@app.get("/automations/{rule_id}", response_model=AutomationRuleResponse)
+async def get_automation_endpoint(rule_id: int):
+    result = await get_automation_rule(app.state.db, rule_id)
+    if not result:
+        raise HTTPException(404, "Automation rule not found")
+    return result
+
+
+@app.patch("/automations/{rule_id}", response_model=AutomationRuleResponse)
+async def update_automation_endpoint(rule_id: int, body: AutomationRuleUpdate):
+    """Update an automation rule's config or enabled state."""
+    result = await update_automation_rule(app.state.db, rule_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Automation rule not found")
+    return result
+
+
+@app.delete("/automations/{rule_id}", status_code=204)
+async def delete_automation_endpoint(rule_id: int):
+    if not await delete_automation_rule(app.state.db, rule_id):
+        raise HTTPException(404, "Automation rule not found")
+
+
+@app.post("/automations/evaluate/{prospect_id}")
+async def evaluate_automation_endpoint(prospect_id: int, body: AutomationEvaluateRequest):
+    """Manually trigger automation evaluation for a prospect with specific trigger data."""
+    p = await get_prospect(app.state.db, prospect_id)
+    if not p:
+        raise HTTPException(404, "Prospect not found")
+    from models import VALID_TRIGGER_TYPES
+    if body.trigger_type not in VALID_TRIGGER_TYPES:
+        raise HTTPException(422, f"Invalid trigger_type. Must be one of: {', '.join(sorted(VALID_TRIGGER_TYPES))}")
+    fired = await evaluate_automation_for_prospect(
+        app.state.db, prospect_id, body.trigger_type, body.trigger_data,
+    )
+    return {"prospect_id": prospect_id, "rules_fired": fired, "count": len(fired)}
