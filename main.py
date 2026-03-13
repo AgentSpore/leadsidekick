@@ -16,6 +16,8 @@ from models import (
     EnrollmentResponse, AdvanceResult,
     CampaignEventCreate, SequenceAnalytics, CampaignOverview,
     LeadScore, TopLead, StageUpdate, PipelineSummary, ToneAnalytics,
+    ProspectActivity, SequenceCloneRequest,
+    DncCreate, DncResponse,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -24,12 +26,13 @@ from engine import (
     create_prospect_list, list_prospect_lists, get_stats,
     search_prospects, export_prospects_csv,
     create_sequence, list_sequences, enroll_prospect,
-    list_enrollments, advance_sequence,
+    list_enrollments, advance_sequence, clone_sequence,
     add_prospect_tag, remove_prospect_tag,
     record_event, get_sequence_analytics, get_campaign_overview,
     compute_lead_score, get_top_leads,
     update_prospect_stage, get_pipeline_summary,
-    get_tone_analytics,
+    get_tone_analytics, get_prospect_activity,
+    add_dnc, list_dnc, delete_dnc,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -44,8 +47,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="LeadSidekick",
-    description="Lead prospecting + personalised cold outreach drafter. Find prospects, generate tailored emails in seconds.",
-    version="0.6.0",
+    description=(
+        "Lead prospecting + personalised cold outreach drafter. "
+        "Prospect management, sequences, campaign analytics, lead scoring, "
+        "pipeline tracking, tone A/B testing, prospect activity log, "
+        "sequence cloning, and do-not-contact list."
+    ),
+    version="0.7.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -53,7 +61,28 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.6.0"}
+    return {"status": "ok", "version": "0.7.0"}
+
+
+# ── Do-Not-Contact ───────────────────────────────────────────────────────
+
+@app.post("/dnc", response_model=DncResponse, status_code=201)
+async def create_dnc(body: DncCreate):
+    """Add an email or domain to the do-not-contact blocklist."""
+    if not body.email and not body.domain:
+        raise HTTPException(422, "Must provide either email or domain")
+    return await add_dnc(app.state.db, body.model_dump())
+
+
+@app.get("/dnc", response_model=list[DncResponse])
+async def get_dnc_list():
+    return await list_dnc(app.state.db)
+
+
+@app.delete("/dnc/{dnc_id}", status_code=204)
+async def remove_dnc(dnc_id: int):
+    if not await delete_dnc(app.state.db, dnc_id):
+        raise HTTPException(404, "DNC entry not found")
 
 
 # ── Prospect Lists ────────────────────────────────────────────────
@@ -72,7 +101,11 @@ async def get_lists():
 
 @app.post("/prospects", response_model=ProspectResponse, status_code=201)
 async def add_prospect(body: ProspectCreate):
-    return await create_prospect(app.state.db, body.model_dump())
+    result = await create_prospect(app.state.db, body.model_dump())
+    if isinstance(result, str) and result.startswith("blocked_by_dnc:"):
+        blocked_by = result.split(":", 1)[1]
+        raise HTTPException(422, f"Email blocked by DNC list: {blocked_by}")
+    return result
 
 
 @app.post("/prospects/bulk", status_code=201)
@@ -84,7 +117,6 @@ async def bulk_import(body: BulkImportRequest):
     )
 
 
-# search and export/csv BEFORE /{prospect_id} to avoid route conflicts
 @app.get("/prospects/search", response_model=list[ProspectResponse])
 async def search(q: str = Query(..., min_length=2, description="Search term (min 2 chars)")):
     """Full-text search across first_name, last_name, email, company, job_title."""
@@ -128,17 +160,30 @@ async def patch_status(prospect_id: int, status: str = Query(...)):
     return p
 
 
+# ── Prospect Activity Log ────────────────────────────────────────────────
+
+@app.get("/prospects/{prospect_id}/activity", response_model=ProspectActivity)
+async def prospect_activity(prospect_id: int):
+    """Full timeline of all interactions with a prospect."""
+    result = await get_prospect_activity(app.state.db, prospect_id)
+    if not result:
+        raise HTTPException(404, "Prospect not found")
+    return result
+
+
 # ── Draft Generation ──────────────────────────────────────────────
 
 @app.post("/draft", response_model=DraftResponse)
-async def generate_draft(body: DraftRequest):
+async def generate_draft_endpoint(body: DraftRequest):
     p = await get_prospect(app.state.db, body.prospect_id)
     if not p:
         raise HTTPException(404, "Prospect not found")
     result = await create_draft(
         app.state.db, body.prospect_id, body.template_id,
-        body.tone, body.context, body.your_value_prop, body.cta,
+        body.tone, body.context, body.value_prop, body.cta,
     )
+    if result == "dnc_blocked":
+        raise HTTPException(422, "Prospect is on the do-not-contact list")
     if not result:
         raise HTTPException(500, "Draft generation failed")
     return result
@@ -185,12 +230,23 @@ async def get_sequences():
     return await list_sequences(app.state.db)
 
 
+@app.post("/sequences/{sequence_id}/clone", response_model=SequenceResponse, status_code=201)
+async def clone_seq(sequence_id: int, body: SequenceCloneRequest):
+    """Clone a sequence with all steps. Enrollments are not copied."""
+    result = await clone_sequence(app.state.db, sequence_id, body.new_name)
+    if not result:
+        raise HTTPException(404, "Sequence not found")
+    return result
+
+
 @app.post("/sequences/{sequence_id}/enroll/{prospect_id}", response_model=EnrollmentResponse, status_code=201)
 async def enroll(sequence_id: int, prospect_id: int):
     p = await get_prospect(app.state.db, prospect_id)
     if not p:
         raise HTTPException(404, "Prospect not found")
     result = await enroll_prospect(app.state.db, sequence_id, prospect_id)
+    if result == "dnc_blocked":
+        raise HTTPException(422, "Prospect is on the do-not-contact list")
     if not result:
         raise HTTPException(409, "Prospect already enrolled in this sequence")
     return result
@@ -214,7 +270,6 @@ async def advance(sequence_id: int):
 @app.get("/stats", response_model=UsageStats)
 async def stats():
     return await get_stats(app.state.db)
-
 
 
 # ── Tags ─────────────────────────────────────────────────────────────────
