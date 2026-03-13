@@ -107,6 +107,9 @@ class UsageStats(BaseModel):
     total_sequences: int
     total_dnc_entries: int
     total_smart_lists: int
+    total_segments: int
+    total_ab_tests: int
+    total_automation_rules: int
     by_status: dict[str, int]
     most_used_tone: Optional[str]
 
@@ -389,3 +392,133 @@ class OutreachCalendar(BaseModel):
     total_scheduled: int
     by_date: list[CalendarDay]
     by_sequence: list[CalendarSequenceSummary]
+
+
+# ── Email A/B Testing (v1.0.0) ──────────────────────────────────────────
+
+class VariantStats(BaseModel):
+    sent: int
+    opened: int
+    replied: int
+    open_rate: float
+    reply_rate: float
+
+
+class ABTestCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    sequence_id: Optional[int] = None
+    variant_a_tone: str = Field(..., description="Tone for variant A")
+    variant_a_subject_hint: str = Field(..., description="Subject hint for variant A")
+    variant_b_tone: str = Field(..., description="Tone for variant B")
+    variant_b_subject_hint: str = Field(..., description="Subject hint for variant B")
+
+
+class ABTestResponse(BaseModel):
+    id: int
+    name: str
+    sequence_id: Optional[int]
+    variant_a_tone: str
+    variant_a_subject_hint: str
+    variant_b_tone: str
+    variant_b_subject_hint: str
+    status: str
+    winner: Optional[str]
+    variant_a_stats: VariantStats
+    variant_b_stats: VariantStats
+    created_at: str
+    completed_at: Optional[str]
+
+
+class ABTestAssignment(BaseModel):
+    prospect_id: int
+    variant: Optional[str] = Field(None, description="a | b  (auto round-robin if omitted)")
+
+
+class ABTestComplete(BaseModel):
+    winner: Optional[str] = Field(None, description="a | b  (auto-determine if omitted)")
+
+
+class ABTestAssignmentResponse(BaseModel):
+    id: int
+    test_id: int
+    prospect_id: int
+    variant: str
+    created_at: str
+
+
+# ── Prospect Segments (v1.0.0) ──────────────────────────────────────────
+
+class SegmentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: Optional[str] = None
+    criteria: dict = Field(
+        ...,
+        description="Criteria: score_min, score_max, min_events, status, has_tag, company_contains, enrolled_in_sequence",
+    )
+    auto_assign: bool = Field(False, description="Auto-evaluate on segment evaluate call")
+
+
+class SegmentUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    description: Optional[str] = None
+    criteria: Optional[dict] = None
+    auto_assign: Optional[bool] = None
+
+
+class SegmentResponse(BaseModel):
+    id: int
+    name: str
+    description: Optional[str]
+    criteria: dict
+    auto_assign: bool
+    prospect_count: int
+    created_at: str
+
+
+class SegmentProspectEntry(BaseModel):
+    prospect_id: int
+    name: str
+    email: str
+    company: str
+    score: int
+    grade: str
+
+
+# ── Outreach Automation Rules (v1.0.0) ──────────────────────────────────
+
+VALID_TRIGGER_TYPES = {"status_change", "event_received", "score_threshold", "enrollment_completed"}
+VALID_ACTION_TYPES = {"enroll_in_sequence", "add_tag", "remove_tag", "change_status", "pause_enrollment"}
+
+
+class AutomationRuleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    trigger_type: str = Field(..., description="status_change | event_received | score_threshold | enrollment_completed")
+    trigger_config: dict = Field(..., description="Trigger-specific configuration")
+    action_type: str = Field(..., description="enroll_in_sequence | add_tag | remove_tag | change_status | pause_enrollment")
+    action_config: dict = Field(..., description="Action-specific configuration")
+    is_enabled: bool = Field(True)
+
+
+class AutomationRuleUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    trigger_config: Optional[dict] = None
+    action_config: Optional[dict] = None
+    is_enabled: Optional[bool] = None
+
+
+class AutomationRuleResponse(BaseModel):
+    id: int
+    name: str
+    trigger_type: str
+    trigger_config: dict
+    action_type: str
+    action_config: dict
+    is_enabled: bool
+    times_fired: int
+    last_fired_at: Optional[str]
+    created_at: str
+
+
+class AutomationEvaluateRequest(BaseModel):
+    trigger_type: str = Field(..., description="status_change | event_received | score_threshold | enrollment_completed")
+    trigger_data: dict = Field(default_factory=dict, description="Trigger-specific data for evaluation")
