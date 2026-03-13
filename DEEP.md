@@ -1,39 +1,67 @@
 # LeadSidekick — Architecture (DEEP.md)
 
 ## Overview
-Lead finder + personalized cold outreach drafter. API-first service for managing prospects, generating tone-aware email drafts, running multi-step sequences, and tracking campaign analytics.
+Lead prospecting + personalised cold outreach drafter. Find prospects, generate tailored emails, manage pipeline, score leads.
 
-## Data Model
-- **prospect_lists** — named lists for organizing prospects
-- **prospects** — contact info + job_title + tags (JSON array) + status
-- **templates** — subject/body templates with {{placeholder}} support
-- **draft_log** — generated drafts with tone and template reference
-- **sequences** — multi-step outreach (steps with delay_days, tone, subject_hint)
-- **enrollments** — prospect-to-sequence mapping with step tracking
-- **campaign_events** — sent/opened/replied/bounced/clicked tracking
-- **usage_stats** — singleton total_drafts counter
+## Stack
+- **Runtime**: Python 3.11+ / FastAPI / uvicorn
+- **Database**: aiosqlite (SQLite WAL mode)
+- **Models**: Pydantic v2 with Field validation
 
-## Tone System
-4 tones with distinct openers, closers, and followup openers:
-- professional, friendly, direct, witty
+## API Endpoints (v0.6.0) — 30+ endpoints
 
-## Draft Generation Pipeline
-1. Load prospect data
-2. Select tone-appropriate opener (deterministic hash-based selection)
-3. Build subject line (tone-dependent format)
-4. Compose body with value_prop, context, CTA
-5. If template_id provided: render template with {{placeholders}} override
-6. Log to draft_log, increment usage_stats
+### Prospect Lists
+- POST /lists, GET /lists
 
-## Tag System
-- Tags stored as JSON array on prospects
-- Case-insensitive, deduplicated on add
-- Filter: LIKE query on JSON text (simple, no FTS needed)
+### Prospects
+- POST /prospects, POST /prospects/bulk, GET /prospects, GET /prospects/{id}
+- PATCH /prospects/{id}/status, GET /prospects/search, GET /prospects/export/csv
 
-## Campaign Analytics
-- Events table: prospect_id, sequence_id, draft_id, event_type, metadata
-- Per-sequence analytics: enrolled/completed/sent/opened/replied/bounced + rates
-- Campaign overview: totals + top sequences by event count
+### Lead Scoring
+- GET /prospects/{id}/score — engagement-based score (0-100) with breakdown
+- GET /leads/top — top prospects ranked by score
 
-## API Surface (v0.5.0)
-19 endpoints covering prospects, drafts, templates, lists, sequences, tags, events, analytics.
+### Pipeline
+- PUT /prospects/{id}/stage — move through stages (new/contacted/interested/qualified/converted/lost)
+- GET /pipeline — funnel summary with conversion rate
+
+### Draft Generation
+- POST /draft, GET /drafts, GET /drafts/{id}
+
+### Templates
+- POST /templates, GET /templates
+
+### Sequences
+- POST /sequences, GET /sequences
+- POST /sequences/{id}/enroll/{prospect_id}
+- GET /sequences/{id}/enrollments
+- POST /sequences/{id}/advance
+
+### Tags
+- POST /prospects/{id}/tags, DELETE /prospects/{id}/tags
+
+### Analytics
+- GET /analytics/campaigns — overall campaign stats
+- GET /analytics/tones — A/B tone comparison (open/reply rate per tone)
+- GET /sequences/{id}/analytics — per-sequence performance
+- POST /events — record campaign event
+
+### Stats & Health
+- GET /stats — usage statistics
+- GET /health
+
+## Key Features
+- **Lead Scoring**: 5 factors (profile completeness, engagement, recency, tags, enrollment) → hot/warm/cold grade
+- **Pipeline Stages**: 6-stage funnel with automatic stage_change event logging
+- **Tone A/B Analytics**: Compare drafts/open_rate/reply_rate across 4 tones
+- **Sequences**: Multi-step follow-up with delay-based progression
+- **Tags**: Freeform segmentation tags on prospects
+- **Campaign Events**: Track sent/opened/replied/bounced/clicked
+
+## Version History
+- v0.1.0: Prospects, draft generation, templates
+- v0.2.0: Draft history, prospect lists
+- v0.3.0: Prospect search, CSV export
+- v0.4.0: Follow-up sequences with enrollment
+- v0.5.0: Tags, campaign events, sequence analytics
+- v0.6.0: Lead scoring, pipeline stages, tone A/B analytics
