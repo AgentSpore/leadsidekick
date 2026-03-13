@@ -186,3 +186,54 @@ class CampaignOverview(BaseModel):
     overall_open_rate: float
     overall_reply_rate: float
     top_sequences: list[dict]
+
+
+# ── Lead Scoring ────────────────────────────────────────────────────────
+
+class LeadScore(BaseModel):
+    prospect_id: int
+    score: int
+    grade: str  # hot | warm | cold
+    breakdown: dict[str, int]
+    events_summary: dict[str, int]
+
+
+class TopLead(BaseModel):
+    prospect_id: int
+    name: str
+    email: str
+    company: str
+    score: int
+    grade: str
+    status: str
+
+
+# ── Pipeline ────────────────────────────────────────────────────────────
+
+class StageUpdate(BaseModel):
+    stage: str = Field(..., description="new | contacted | interested | qualified | converted | lost")
+    notes: Optional[str] = Field(None, description="Optional notes about the stage change")
+
+
+class PipelineFunnelStage(BaseModel):
+    stage: str
+    count: int
+    pct: float
+
+
+class PipelineSummary(BaseModel):
+    total_prospects: int
+    stages: list[PipelineFunnelStage]
+    conversion_rate: float
+
+
+# ── Tone Analytics ──────────────────────────────────────────────────────
+
+class ToneAnalytics(BaseModel):
+    tone: str
+    drafts: int
+    sent: int
+    opened: int
+    replied: int
+    open_rate: float
+    reply_rate: float
