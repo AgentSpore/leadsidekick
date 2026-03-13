@@ -87,8 +87,18 @@ CREATE TABLE IF NOT EXISTS campaign_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS dnc_list (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT,
+    domain TEXT,
+    reason TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_prospect ON campaign_events(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_events_sequence ON campaign_events(sequence_id);
+CREATE INDEX IF NOT EXISTS idx_dnc_email ON dnc_list(email);
+CREATE INDEX IF NOT EXISTS idx_dnc_domain ON dnc_list(domain);
 
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
@@ -253,7 +263,62 @@ def generate_followup_draft(prospect: dict, tone: str, step_num: int,
     }
 
 
-async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict:
+# ── Do-Not-Contact ──────────────────────────────────────────────────────
+
+async def check_dnc(db: aiosqlite.Connection, email: str) -> dict | None:
+    """Check if an email or its domain is on the DNC list. Returns the blocking entry or None."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM dnc_list WHERE email = ?", (email.lower(),))
+    if rows:
+        r = rows[0]
+        return {"id": r["id"], "email": r["email"], "domain": r["domain"],
+                "reason": r["reason"], "created_at": r["created_at"]}
+    domain = email.lower().split("@")[-1] if "@" in email else None
+    if domain:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM dnc_list WHERE domain = ?", (domain,))
+        if rows:
+            r = rows[0]
+            return {"id": r["id"], "email": r["email"], "domain": r["domain"],
+                    "reason": r["reason"], "created_at": r["created_at"]}
+    return None
+
+
+async def add_dnc(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    email = data.get("email", "").lower().strip() or None
+    domain = data.get("domain", "").lower().strip() or None
+    cur = await db.execute(
+        "INSERT INTO dnc_list (email, domain, reason, created_at) VALUES (?,?,?,?)",
+        (email, domain, data.get("reason"), now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM dnc_list WHERE id = ?", (cur.lastrowid,))
+    r = rows[0]
+    return {"id": r["id"], "email": r["email"], "domain": r["domain"],
+            "reason": r["reason"], "created_at": r["created_at"]}
+
+
+async def list_dnc(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM dnc_list ORDER BY created_at DESC")
+    return [{"id": r["id"], "email": r["email"], "domain": r["domain"],
+             "reason": r["reason"], "created_at": r["created_at"]} for r in rows]
+
+
+async def delete_dnc(db: aiosqlite.Connection, dnc_id: int) -> bool:
+    cur = await db.execute("DELETE FROM dnc_list WHERE id = ?", (dnc_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── Prospects ─────────────────────────────────────────────────────────────
+
+async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict | str:
+    # DNC check
+    dnc = await check_dnc(db, data["email"])
+    if dnc:
+        blocked_by = dnc.get("email") or dnc.get("domain")
+        return f"blocked_by_dnc:{blocked_by}"
     now = datetime.now(timezone.utc).isoformat()
     tags_json = jsonlib.dumps(data.get("tags", []))
     cur = await db.execute(
@@ -299,24 +364,29 @@ async def update_prospect_status(db: aiosqlite.Connection, prospect_id: int, sta
 
 async def bulk_import_prospects(db: aiosqlite.Connection, prospects: list[dict],
                                  list_id: int | None) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
-    created, skipped = 0, 0
+    created, skipped, dnc_blocked = 0, 0, 0
     for p in prospects:
         if list_id:
             p["list_id"] = list_id
-        try:
-            await create_prospect(db, p)
+        result = await create_prospect(db, p)
+        if isinstance(result, str) and result.startswith("blocked_by_dnc:"):
+            dnc_blocked += 1
+        elif isinstance(result, dict):
             created += 1
-        except Exception:
+        else:
             skipped += 1
-    return {"created": created, "skipped": skipped}
+    return {"created": created, "skipped": skipped, "dnc_blocked": dnc_blocked}
 
 
 async def create_draft(db: aiosqlite.Connection, prospect_id: int, template_id: int | None,
-                       tone: str, context: str | None, value_prop: str, cta: str) -> dict:
+                       tone: str, context: str | None, value_prop: str, cta: str) -> dict | str:
     prospect = await get_prospect(db, prospect_id)
     if not prospect:
         return {}
+    # DNC check before generating draft
+    dnc = await check_dnc(db, prospect["email"])
+    if dnc:
+        return "dnc_blocked"
     draft = generate_draft(prospect, tone, context, value_prop, cta)
 
     if template_id:
@@ -387,6 +457,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     total_l = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM prospect_lists"))[0]["cnt"]
     total_t = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM templates"))[0]["cnt"]
     total_s = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM sequences"))[0]["cnt"]
+    total_dnc = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM dnc_list"))[0]["cnt"]
     stats_row = await db.execute_fetchall("SELECT * FROM usage_stats WHERE id = 1")
     total_drafts = stats_row[0]["total_drafts"] if stats_row else 0
     status_rows = await db.execute_fetchall("SELECT status, COUNT(*) as cnt FROM prospects GROUP BY status")
@@ -396,7 +467,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     return {
         "total_prospects": total_p, "total_drafts_generated": total_drafts,
         "total_lists": total_l, "total_templates": total_t,
-        "total_sequences": total_s,
+        "total_sequences": total_s, "total_dnc_entries": total_dnc,
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
 
@@ -498,6 +569,22 @@ async def _get_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None:
     }
 
 
+async def clone_sequence(db: aiosqlite.Connection, seq_id: int,
+                          new_name: str | None = None) -> dict | None:
+    """Clone a sequence with all its steps. Enrollments are NOT copied."""
+    src = await _get_sequence(db, seq_id)
+    if not src:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    name = new_name or f"{src['name']} (copy)"
+    cur = await db.execute(
+        "INSERT INTO sequences (name, value_prop, cta, steps, created_at) VALUES (?,?,?,?,?)",
+        (name, src["value_prop"], src["cta"], jsonlib.dumps(src["steps"]), now),
+    )
+    await db.commit()
+    return await _get_sequence(db, cur.lastrowid)
+
+
 async def enroll_prospect(db: aiosqlite.Connection, seq_id: int, prospect_id: int) -> dict | str | None:
     seq = await _get_sequence(db, seq_id)
     if not seq:
@@ -505,6 +592,10 @@ async def enroll_prospect(db: aiosqlite.Connection, seq_id: int, prospect_id: in
     prospect = await get_prospect(db, prospect_id)
     if not prospect:
         return "prospect_not_found"
+    # DNC check
+    dnc = await check_dnc(db, prospect["email"])
+    if dnc:
+        return "dnc_blocked"
     existing = await db.execute_fetchall(
         "SELECT id FROM enrollments WHERE sequence_id=? AND prospect_id=?", (seq_id, prospect_id))
     if existing:
@@ -622,7 +713,6 @@ async def advance_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None
     }
 
 
-
 # ── Tags ─────────────────────────────────────────────────────────────────
 
 async def add_prospect_tag(db: aiosqlite.Connection, prospect_id: int, tag: str) -> dict | None:
@@ -687,10 +777,7 @@ async def get_sequence_analytics(db: aiosqlite.Connection, seq_id: int) -> dict 
         "total_enrolled": enrolled,
         "completed": completed,
         "events": events,
-        "sent": sent,
-        "opened": opened,
-        "replied": replied,
-        "bounced": bounced,
+        "sent": sent, "opened": opened, "replied": replied, "bounced": bounced,
         "open_rate": round(opened / max(sent, 1) * 100, 1),
         "reply_rate": round(replied / max(sent, 1) * 100, 1),
         "bounce_rate": round(bounced / max(sent, 1) * 100, 1),
@@ -715,9 +802,7 @@ async def get_campaign_overview(db: aiosqlite.Connection) -> dict:
     return {
         "total_events": total_events,
         "by_type": by_type,
-        "sent": sent,
-        "opened": opened,
-        "replied": replied,
+        "sent": sent, "opened": opened, "replied": replied,
         "overall_open_rate": round(opened / max(sent, 1) * 100, 1),
         "overall_reply_rate": round(replied / max(sent, 1) * 100, 1),
         "top_sequences": top_sequences,
@@ -727,7 +812,6 @@ async def get_campaign_overview(db: aiosqlite.Connection) -> dict:
 # ── Lead Scoring ─────────────────────────────────────────────────────────
 
 async def compute_lead_score(db: aiosqlite.Connection, prospect_id: int) -> dict | None:
-    """Score a prospect 0-100 based on engagement, profile completeness, and recency."""
     prospect = await get_prospect(db, prospect_id)
     if not prospect:
         return None
@@ -735,14 +819,12 @@ async def compute_lead_score(db: aiosqlite.Connection, prospect_id: int) -> dict
     score = 0
     breakdown = {}
 
-    # Profile completeness (max 25)
     fields = ["job_title", "website", "linkedin_url", "notes"]
     filled = sum(1 for f in fields if prospect.get(f))
     profile_pts = round(filled / len(fields) * 25)
     score += profile_pts
     breakdown["profile_completeness"] = profile_pts
 
-    # Engagement from events (max 45)
     events = await db.execute_fetchall(
         "SELECT event_type, COUNT(*) as cnt FROM campaign_events WHERE prospect_id = ? GROUP BY event_type",
         (prospect_id,),
@@ -767,7 +849,6 @@ async def compute_lead_score(db: aiosqlite.Connection, prospect_id: int) -> dict
     score += engagement_pts
     breakdown["engagement"] = engagement_pts
 
-    # Recency (max 15) — last event within 7d = 15, 14d = 10, 30d = 5, else 0
     last_event = await db.execute_fetchall(
         "SELECT MAX(created_at) as last_at FROM campaign_events WHERE prospect_id = ?",
         (prospect_id,),
@@ -785,13 +866,11 @@ async def compute_lead_score(db: aiosqlite.Connection, prospect_id: int) -> dict
     score += recency_pts
     breakdown["recency"] = recency_pts
 
-    # Tags bonus (max 10)
     tags = prospect.get("tags", [])
     tag_pts = min(len(tags) * 3, 10)
     score += tag_pts
     breakdown["tags"] = tag_pts
 
-    # Enrollment bonus (max 5)
     enrollments = await db.execute_fetchall(
         "SELECT COUNT(*) as cnt FROM enrollments WHERE prospect_id = ?", (prospect_id,))
     enroll_pts = min(enrollments[0]["cnt"] * 5, 5) if enrollments else 0
@@ -809,15 +888,13 @@ async def compute_lead_score(db: aiosqlite.Connection, prospect_id: int) -> dict
 
     return {
         "prospect_id": prospect_id,
-        "score": score,
-        "grade": grade,
+        "score": score, "grade": grade,
         "breakdown": breakdown,
         "events_summary": {"sent": sent, "opened": opened, "replied": replied, "clicked": clicked, "bounced": bounced},
     }
 
 
 async def get_top_leads(db: aiosqlite.Connection, limit: int = 20) -> list[dict]:
-    """Return top-scored prospects."""
     rows = await db.execute_fetchall("SELECT id FROM prospects ORDER BY created_at DESC LIMIT 200")
     scored = []
     for r in rows:
@@ -827,11 +904,8 @@ async def get_top_leads(db: aiosqlite.Connection, limit: int = 20) -> list[dict]
             scored.append({
                 "prospect_id": r["id"],
                 "name": f"{p['first_name']} {p['last_name']}",
-                "email": p["email"],
-                "company": p["company"],
-                "score": s["score"],
-                "grade": s["grade"],
-                "status": p["status"],
+                "email": p["email"], "company": p["company"],
+                "score": s["score"], "grade": s["grade"], "status": p["status"],
             })
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored[:limit]
@@ -844,7 +918,6 @@ VALID_STAGES = {"new", "contacted", "interested", "qualified", "converted", "los
 
 async def update_prospect_stage(db: aiosqlite.Connection, prospect_id: int,
                                  stage: str, notes: str | None = None) -> dict | str | None:
-    """Move prospect to a new pipeline stage. Returns updated prospect or error string."""
     if stage not in VALID_STAGES:
         return f"Invalid stage. Must be one of: {', '.join(sorted(VALID_STAGES))}"
     prospect = await get_prospect(db, prospect_id)
@@ -852,7 +925,6 @@ async def update_prospect_stage(db: aiosqlite.Connection, prospect_id: int,
         return None
     old_stage = prospect["status"]
     await db.execute("UPDATE prospects SET status = ? WHERE id = ?", (stage, prospect_id))
-    # Log the transition as a campaign event
     now = datetime.now(timezone.utc).isoformat()
     await db.execute(
         "INSERT INTO campaign_events (prospect_id, sequence_id, draft_id, event_type, metadata, created_at) VALUES (?,?,?,?,?,?)",
@@ -864,7 +936,6 @@ async def update_prospect_stage(db: aiosqlite.Connection, prospect_id: int,
 
 
 async def get_pipeline_summary(db: aiosqlite.Connection) -> dict:
-    """Get pipeline funnel: count and total per stage."""
     rows = await db.execute_fetchall(
         "SELECT status, COUNT(*) as cnt FROM prospects GROUP BY status ORDER BY cnt DESC"
     )
@@ -874,8 +945,7 @@ async def get_pipeline_summary(db: aiosqlite.Connection) -> dict:
     for stage in ["new", "contacted", "interested", "qualified", "converted", "lost"]:
         count = stages.get(stage, 0)
         funnel.append({
-            "stage": stage,
-            "count": count,
+            "stage": stage, "count": count,
             "pct": round(count / max(total, 1) * 100, 1),
         })
     converted = stages.get("converted", 0)
@@ -890,14 +960,12 @@ async def get_pipeline_summary(db: aiosqlite.Connection) -> dict:
 # ── Tone A/B Analytics ──────────────────────────────────────────────────
 
 async def get_tone_analytics(db: aiosqlite.Connection) -> list[dict]:
-    """Compare performance across tones: drafts generated, open rate, reply rate."""
     tones = await db.execute_fetchall(
         "SELECT tone, COUNT(*) as drafts FROM draft_log GROUP BY tone ORDER BY drafts DESC"
     )
     result = []
     for t in tones:
         tone = t["tone"]
-        # Get draft IDs for this tone
         draft_ids = await db.execute_fetchall(
             "SELECT id FROM draft_log WHERE tone = ?", (tone,))
         ids = [d["id"] for d in draft_ids]
@@ -916,12 +984,85 @@ async def get_tone_analytics(db: aiosqlite.Connection) -> list[dict]:
         opened = ev.get("opened", 0)
         replied = ev.get("replied", 0)
         result.append({
-            "tone": tone,
-            "drafts": t["drafts"],
-            "sent": sent,
-            "opened": opened,
-            "replied": replied,
+            "tone": tone, "drafts": t["drafts"],
+            "sent": sent, "opened": opened, "replied": replied,
             "open_rate": round(opened / max(sent, 1) * 100, 1),
             "reply_rate": round(replied / max(sent, 1) * 100, 1),
         })
     return result
+
+
+# ── Prospect Activity Log ────────────────────────────────────────────────
+
+async def get_prospect_activity(db: aiosqlite.Connection, prospect_id: int) -> dict | None:
+    """Full timeline of all interactions with a prospect."""
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return None
+
+    activity = []
+
+    # Prospect creation
+    activity.append({
+        "type": "prospect_created",
+        "timestamp": prospect["created_at"],
+        "detail": f"Added to system (status: {prospect['status']})",
+        "metadata": None,
+    })
+
+    # Drafts generated
+    drafts = await db.execute_fetchall(
+        "SELECT * FROM draft_log WHERE prospect_id = ? ORDER BY created_at ASC",
+        (prospect_id,),
+    )
+    for d in drafts:
+        activity.append({
+            "type": "draft_generated",
+            "timestamp": d["created_at"],
+            "detail": f"Draft #{d['id']}: \"{d['subject']}\" (tone: {d['tone']})",
+            "metadata": {"draft_id": d["id"], "tone": d["tone"]},
+        })
+
+    # Campaign events
+    events = await db.execute_fetchall(
+        "SELECT * FROM campaign_events WHERE prospect_id = ? ORDER BY created_at ASC",
+        (prospect_id,),
+    )
+    for e in events:
+        meta = jsonlib.loads(e["metadata"]) if e["metadata"] else {}
+        if e["event_type"] == "stage_change":
+            detail = f"Stage: {meta.get('from', '?')} → {meta.get('to', '?')}"
+            if meta.get("notes"):
+                detail += f" ({meta['notes']})"
+        else:
+            detail = f"Event: {e['event_type']}"
+            if e["sequence_id"]:
+                detail += f" (sequence #{e['sequence_id']})"
+        activity.append({
+            "type": e["event_type"],
+            "timestamp": e["created_at"],
+            "detail": detail,
+            "metadata": meta or None,
+        })
+
+    # Enrollments
+    enrollments = await db.execute_fetchall(
+        "SELECT e.*, s.name as seq_name FROM enrollments e JOIN sequences s ON e.sequence_id = s.id WHERE e.prospect_id = ? ORDER BY e.enrolled_at ASC",
+        (prospect_id,),
+    )
+    for en in enrollments:
+        activity.append({
+            "type": "sequence_enrolled",
+            "timestamp": en["enrolled_at"],
+            "detail": f"Enrolled in sequence \"{en['seq_name']}\" (status: {en['status']}, step {en['current_step']})",
+            "metadata": {"sequence_id": en["sequence_id"], "status": en["status"]},
+        })
+
+    activity.sort(key=lambda a: a["timestamp"])
+
+    return {
+        "prospect_id": prospect_id,
+        "prospect_name": f"{prospect['first_name']} {prospect['last_name']}",
+        "total_events": len(activity),
+        "activity": activity,
+    }
