@@ -18,6 +18,9 @@ from models import (
     LeadScore, TopLead, StageUpdate, PipelineSummary, ToneAnalytics,
     ProspectActivity, SequenceCloneRequest,
     DncCreate, DncResponse,
+    SmartListCreate, SmartListResponse,
+    EnrollmentActionResult, BulkEnrollmentResult,
+    DuplicateGroup, MergeRequest, MergeResult,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -33,6 +36,11 @@ from engine import (
     update_prospect_stage, get_pipeline_summary,
     get_tone_analytics, get_prospect_activity,
     add_dnc, list_dnc, delete_dnc,
+    create_smart_list, list_smart_lists, get_smart_list,
+    get_smart_list_prospects, delete_smart_list,
+    pause_enrollment, resume_enrollment,
+    pause_all_enrollments, resume_all_enrollments,
+    find_duplicates, merge_prospects,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -49,11 +57,12 @@ app = FastAPI(
     title="LeadSidekick",
     description=(
         "Lead prospecting + personalised cold outreach drafter. "
-        "Prospect management, sequences, campaign analytics, lead scoring, "
-        "pipeline tracking, tone A/B testing, prospect activity log, "
-        "sequence cloning, and do-not-contact list."
+        "Prospect management, sequences with pause/resume, campaign analytics, "
+        "lead scoring, pipeline tracking, tone A/B testing, prospect activity log, "
+        "sequence cloning, do-not-contact list, smart lists (saved filters), "
+        "and prospect deduplication with merge."
     ),
-    version="0.7.0",
+    version="0.8.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -61,7 +70,43 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.7.0"}
+    return {"status": "ok", "version": "0.8.0"}
+
+
+# ── Smart Lists ─────────────────────────────────────────────────────────
+
+@app.post("/smart-lists", response_model=SmartListResponse, status_code=201)
+async def create_smart(body: SmartListCreate):
+    """Create a smart list with saved filter criteria. Matching count is computed dynamically."""
+    return await create_smart_list(app.state.db, body.model_dump())
+
+
+@app.get("/smart-lists", response_model=list[SmartListResponse])
+async def get_smart_lists():
+    return await list_smart_lists(app.state.db)
+
+
+@app.get("/smart-lists/{smart_list_id}", response_model=SmartListResponse)
+async def get_smart_list_detail(smart_list_id: int):
+    sl = await get_smart_list(app.state.db, smart_list_id)
+    if not sl:
+        raise HTTPException(404, "Smart list not found")
+    return sl
+
+
+@app.get("/smart-lists/{smart_list_id}/prospects", response_model=list[ProspectResponse])
+async def smart_list_prospects(smart_list_id: int):
+    """Get all prospects matching this smart list's filters."""
+    result = await get_smart_list_prospects(app.state.db, smart_list_id)
+    if result is None:
+        raise HTTPException(404, "Smart list not found")
+    return result
+
+
+@app.delete("/smart-lists/{smart_list_id}", status_code=204)
+async def remove_smart_list(smart_list_id: int):
+    if not await delete_smart_list(app.state.db, smart_list_id):
+        raise HTTPException(404, "Smart list not found")
 
 
 # ── Do-Not-Contact ───────────────────────────────────────────────────────
@@ -134,6 +179,25 @@ async def export_csv(
         iter([data]), media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=prospects.csv"}
     )
+
+
+@app.get("/prospects/duplicates", response_model=list[DuplicateGroup])
+async def duplicates():
+    """Find potential duplicate prospects by email or by name+company match."""
+    return await find_duplicates(app.state.db)
+
+
+@app.post("/prospects/merge", response_model=MergeResult)
+async def merge(body: MergeRequest):
+    """Merge two prospects: keep one, transfer all data (drafts, events, enrollments) from the other."""
+    result = await merge_prospects(app.state.db, body.keep_id, body.merge_id)
+    if result is None:
+        raise HTTPException(404, "Keep prospect not found")
+    if result == "merge_not_found":
+        raise HTTPException(404, "Merge prospect not found")
+    if result == "same_prospect":
+        raise HTTPException(422, "Cannot merge a prospect with itself")
+    return result
 
 
 @app.get("/prospects", response_model=list[ProspectResponse])
@@ -260,6 +324,44 @@ async def get_enrollments(sequence_id: int):
 @app.post("/sequences/{sequence_id}/advance", response_model=AdvanceResult)
 async def advance(sequence_id: int):
     result = await advance_sequence(app.state.db, sequence_id)
+    if result is None:
+        raise HTTPException(404, "Sequence not found")
+    return result
+
+
+# ── Enrollment Pause/Resume ─────────────────────────────────────────────
+
+@app.post("/enrollments/{enrollment_id}/pause", response_model=EnrollmentActionResult)
+async def pause_enroll(enrollment_id: int):
+    """Pause an active enrollment. Paused enrollments skip during sequence advance."""
+    result = await pause_enrollment(app.state.db, enrollment_id)
+    if result is None:
+        raise HTTPException(404, "Enrollment not found")
+    return result
+
+
+@app.post("/enrollments/{enrollment_id}/resume", response_model=EnrollmentActionResult)
+async def resume_enroll(enrollment_id: int):
+    """Resume a paused enrollment. Delay timer resets from resume time."""
+    result = await resume_enrollment(app.state.db, enrollment_id)
+    if result is None:
+        raise HTTPException(404, "Enrollment not found")
+    return result
+
+
+@app.post("/sequences/{sequence_id}/pause-all", response_model=BulkEnrollmentResult)
+async def pause_all(sequence_id: int):
+    """Pause all active enrollments in a sequence."""
+    result = await pause_all_enrollments(app.state.db, sequence_id)
+    if result is None:
+        raise HTTPException(404, "Sequence not found")
+    return result
+
+
+@app.post("/sequences/{sequence_id}/resume-all", response_model=BulkEnrollmentResult)
+async def resume_all(sequence_id: int):
+    """Resume all paused enrollments in a sequence. Delay timers reset from now."""
+    result = await resume_all_enrollments(app.state.db, sequence_id)
     if result is None:
         raise HTTPException(404, "Sequence not found")
     return result
