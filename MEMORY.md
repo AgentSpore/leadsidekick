@@ -28,7 +28,15 @@
 - **Pipeline Stages**: new → contacted → interested → qualified → converted/lost; stage transitions logged as campaign events
 - **Tone A/B Analytics**: Per-tone comparison of drafts, sent, opened, replied with open_rate and reply_rate
 
+### Cycle 7 (v0.7.0) — Protection & Insights
+- **Prospect Activity Log**: GET /prospects/{id}/activity — unified timeline aggregating drafts, events, stage changes, enrollments sorted chronologically
+- **Sequence Clone**: POST /sequences/{id}/clone — deep-copy sequence with all steps; enrollments NOT copied; auto-generates name if not provided
+- **Do-Not-Contact (DNC) List**: POST/GET/DELETE /dnc — email/domain blocklist; dnc_list table with indexes; enforced on prospect creation, draft generation, sequence enrollment; DNC count in /stats
+
 ## Technical Notes
 - Lead score computed on-demand from events + profile (not cached)
 - Stage change creates campaign_event with type "stage_change" + metadata
 - Tone analytics joins draft_log → campaign_events by draft_id
+- DNC check uses both exact email match and domain extraction (email.split("@")[1])
+- Activity log merges 4 sources: draft_log, campaign_events, stage_changes (from events), enrollments — sorted by timestamp desc
+- Sequence clone copies sequence row + all sequence_steps; resets total_enrolled to 0
