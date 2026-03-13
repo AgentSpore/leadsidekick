@@ -722,3 +722,206 @@ async def get_campaign_overview(db: aiosqlite.Connection) -> dict:
         "overall_reply_rate": round(replied / max(sent, 1) * 100, 1),
         "top_sequences": top_sequences,
     }
+
+
+# ── Lead Scoring ─────────────────────────────────────────────────────────
+
+async def compute_lead_score(db: aiosqlite.Connection, prospect_id: int) -> dict | None:
+    """Score a prospect 0-100 based on engagement, profile completeness, and recency."""
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return None
+
+    score = 0
+    breakdown = {}
+
+    # Profile completeness (max 25)
+    fields = ["job_title", "website", "linkedin_url", "notes"]
+    filled = sum(1 for f in fields if prospect.get(f))
+    profile_pts = round(filled / len(fields) * 25)
+    score += profile_pts
+    breakdown["profile_completeness"] = profile_pts
+
+    # Engagement from events (max 45)
+    events = await db.execute_fetchall(
+        "SELECT event_type, COUNT(*) as cnt FROM campaign_events WHERE prospect_id = ? GROUP BY event_type",
+        (prospect_id,),
+    )
+    event_map = {r["event_type"]: r["cnt"] for r in events}
+    sent = event_map.get("sent", 0)
+    opened = event_map.get("opened", 0)
+    replied = event_map.get("replied", 0)
+    clicked = event_map.get("clicked", 0)
+    bounced = event_map.get("bounced", 0)
+
+    engagement_pts = 0
+    if replied > 0:
+        engagement_pts += min(replied * 15, 25)
+    if clicked > 0:
+        engagement_pts += min(clicked * 10, 10)
+    if opened > 0:
+        engagement_pts += min(opened * 3, 10)
+    if bounced > 0:
+        engagement_pts -= min(bounced * 10, 15)
+    engagement_pts = max(0, min(45, engagement_pts))
+    score += engagement_pts
+    breakdown["engagement"] = engagement_pts
+
+    # Recency (max 15) — last event within 7d = 15, 14d = 10, 30d = 5, else 0
+    last_event = await db.execute_fetchall(
+        "SELECT MAX(created_at) as last_at FROM campaign_events WHERE prospect_id = ?",
+        (prospect_id,),
+    )
+    recency_pts = 0
+    if last_event and last_event[0]["last_at"]:
+        last_dt = datetime.fromisoformat(last_event[0]["last_at"])
+        days_ago = (datetime.now(timezone.utc) - last_dt).days
+        if days_ago <= 7:
+            recency_pts = 15
+        elif days_ago <= 14:
+            recency_pts = 10
+        elif days_ago <= 30:
+            recency_pts = 5
+    score += recency_pts
+    breakdown["recency"] = recency_pts
+
+    # Tags bonus (max 10)
+    tags = prospect.get("tags", [])
+    tag_pts = min(len(tags) * 3, 10)
+    score += tag_pts
+    breakdown["tags"] = tag_pts
+
+    # Enrollment bonus (max 5)
+    enrollments = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM enrollments WHERE prospect_id = ?", (prospect_id,))
+    enroll_pts = min(enrollments[0]["cnt"] * 5, 5) if enrollments else 0
+    score += enroll_pts
+    breakdown["enrollment"] = enroll_pts
+
+    score = min(score, 100)
+
+    if score >= 70:
+        grade = "hot"
+    elif score >= 40:
+        grade = "warm"
+    else:
+        grade = "cold"
+
+    return {
+        "prospect_id": prospect_id,
+        "score": score,
+        "grade": grade,
+        "breakdown": breakdown,
+        "events_summary": {"sent": sent, "opened": opened, "replied": replied, "clicked": clicked, "bounced": bounced},
+    }
+
+
+async def get_top_leads(db: aiosqlite.Connection, limit: int = 20) -> list[dict]:
+    """Return top-scored prospects."""
+    rows = await db.execute_fetchall("SELECT id FROM prospects ORDER BY created_at DESC LIMIT 200")
+    scored = []
+    for r in rows:
+        s = await compute_lead_score(db, r["id"])
+        if s:
+            p = await get_prospect(db, r["id"])
+            scored.append({
+                "prospect_id": r["id"],
+                "name": f"{p['first_name']} {p['last_name']}",
+                "email": p["email"],
+                "company": p["company"],
+                "score": s["score"],
+                "grade": s["grade"],
+                "status": p["status"],
+            })
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:limit]
+
+
+# ── Pipeline Stages ──────────────────────────────────────────────────────
+
+VALID_STAGES = {"new", "contacted", "interested", "qualified", "converted", "lost"}
+
+
+async def update_prospect_stage(db: aiosqlite.Connection, prospect_id: int,
+                                 stage: str, notes: str | None = None) -> dict | str | None:
+    """Move prospect to a new pipeline stage. Returns updated prospect or error string."""
+    if stage not in VALID_STAGES:
+        return f"Invalid stage. Must be one of: {', '.join(sorted(VALID_STAGES))}"
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return None
+    old_stage = prospect["status"]
+    await db.execute("UPDATE prospects SET status = ? WHERE id = ?", (stage, prospect_id))
+    # Log the transition as a campaign event
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "INSERT INTO campaign_events (prospect_id, sequence_id, draft_id, event_type, metadata, created_at) VALUES (?,?,?,?,?,?)",
+        (prospect_id, None, None, "stage_change",
+         jsonlib.dumps({"from": old_stage, "to": stage, "notes": notes}), now),
+    )
+    await db.commit()
+    return await get_prospect(db, prospect_id)
+
+
+async def get_pipeline_summary(db: aiosqlite.Connection) -> dict:
+    """Get pipeline funnel: count and total per stage."""
+    rows = await db.execute_fetchall(
+        "SELECT status, COUNT(*) as cnt FROM prospects GROUP BY status ORDER BY cnt DESC"
+    )
+    stages = {r["status"]: r["cnt"] for r in rows}
+    total = sum(stages.values())
+    funnel = []
+    for stage in ["new", "contacted", "interested", "qualified", "converted", "lost"]:
+        count = stages.get(stage, 0)
+        funnel.append({
+            "stage": stage,
+            "count": count,
+            "pct": round(count / max(total, 1) * 100, 1),
+        })
+    converted = stages.get("converted", 0)
+    contacted = stages.get("contacted", 0) + stages.get("interested", 0) + stages.get("qualified", 0) + converted
+    return {
+        "total_prospects": total,
+        "stages": funnel,
+        "conversion_rate": round(converted / max(contacted, 1) * 100, 1) if contacted else 0,
+    }
+
+
+# ── Tone A/B Analytics ──────────────────────────────────────────────────
+
+async def get_tone_analytics(db: aiosqlite.Connection) -> list[dict]:
+    """Compare performance across tones: drafts generated, open rate, reply rate."""
+    tones = await db.execute_fetchall(
+        "SELECT tone, COUNT(*) as drafts FROM draft_log GROUP BY tone ORDER BY drafts DESC"
+    )
+    result = []
+    for t in tones:
+        tone = t["tone"]
+        # Get draft IDs for this tone
+        draft_ids = await db.execute_fetchall(
+            "SELECT id FROM draft_log WHERE tone = ?", (tone,))
+        ids = [d["id"] for d in draft_ids]
+        if not ids:
+            result.append({"tone": tone, "drafts": t["drafts"],
+                          "sent": 0, "opened": 0, "replied": 0,
+                          "open_rate": 0, "reply_rate": 0})
+            continue
+        placeholders = ",".join("?" * len(ids))
+        events = await db.execute_fetchall(
+            f"SELECT event_type, COUNT(*) as cnt FROM campaign_events WHERE draft_id IN ({placeholders}) GROUP BY event_type",
+            ids,
+        )
+        ev = {r["event_type"]: r["cnt"] for r in events}
+        sent = ev.get("sent", 0)
+        opened = ev.get("opened", 0)
+        replied = ev.get("replied", 0)
+        result.append({
+            "tone": tone,
+            "drafts": t["drafts"],
+            "sent": sent,
+            "opened": opened,
+            "replied": replied,
+            "open_rate": round(opened / max(sent, 1) * 100, 1),
+            "reply_rate": round(replied / max(sent, 1) * 100, 1),
+        })
+    return result
