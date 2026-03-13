@@ -14,6 +14,8 @@ from models import (
     BulkImportRequest, UsageStats,
     SequenceCreate, SequenceResponse,
     EnrollmentResponse, AdvanceResult,
+    CampaignEventCreate, SequenceAnalytics, CampaignOverview,
+    LeadScore, TopLead, StageUpdate, PipelineSummary, ToneAnalytics,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -23,6 +25,11 @@ from engine import (
     search_prospects, export_prospects_csv,
     create_sequence, list_sequences, enroll_prospect,
     list_enrollments, advance_sequence,
+    add_prospect_tag, remove_prospect_tag,
+    record_event, get_sequence_analytics, get_campaign_overview,
+    compute_lead_score, get_top_leads,
+    update_prospect_stage, get_pipeline_summary,
+    get_tone_analytics,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -38,7 +45,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LeadSidekick",
     description="Lead prospecting + personalised cold outreach drafter. Find prospects, generate tailored emails in seconds.",
-    version="0.5.0",
+    version="0.6.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -46,7 +53,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 
 # ── Prospect Lists ────────────────────────────────────────────────
@@ -246,3 +253,47 @@ async def sequence_analytics(sequence_id: int):
 @app.get("/analytics/campaigns", response_model=CampaignOverview)
 async def campaign_overview():
     return await get_campaign_overview(app.state.db)
+
+
+# ── Lead Scoring ─────────────────────────────────────────────────────────
+
+@app.get("/prospects/{prospect_id}/score", response_model=LeadScore)
+async def lead_score(prospect_id: int):
+    """Compute engagement-based lead score (0-100) with grade and breakdown."""
+    result = await compute_lead_score(app.state.db, prospect_id)
+    if not result:
+        raise HTTPException(404, "Prospect not found")
+    return result
+
+
+@app.get("/leads/top", response_model=list[TopLead])
+async def top_leads(limit: int = Query(20, ge=1, le=100)):
+    """Top prospects ranked by lead score."""
+    return await get_top_leads(app.state.db, limit)
+
+
+# ── Pipeline ─────────────────────────────────────────────────────────────
+
+@app.put("/prospects/{prospect_id}/stage", response_model=ProspectResponse)
+async def change_stage(prospect_id: int, body: StageUpdate):
+    """Move a prospect to a new pipeline stage."""
+    result = await update_prospect_stage(app.state.db, prospect_id, body.stage, body.notes)
+    if result is None:
+        raise HTTPException(404, "Prospect not found")
+    if isinstance(result, str):
+        raise HTTPException(422, result)
+    return result
+
+
+@app.get("/pipeline", response_model=PipelineSummary)
+async def pipeline_summary():
+    """Pipeline funnel with counts per stage and conversion rate."""
+    return await get_pipeline_summary(app.state.db)
+
+
+# ── Tone A/B Analytics ──────────────────────────────────────────────────
+
+@app.get("/analytics/tones", response_model=list[ToneAnalytics])
+async def tone_analytics():
+    """Compare tone performance: drafts, open rate, reply rate per tone."""
+    return await get_tone_analytics(app.state.db)
