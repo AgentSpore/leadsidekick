@@ -105,6 +105,7 @@ class UsageStats(BaseModel):
     total_lists: int
     total_templates: int
     total_sequences: int
+    total_dnc_entries: int
     by_status: dict[str, int]
     most_used_tone: Optional[str]
 
@@ -212,22 +213,14 @@ class TopLead(BaseModel):
 
 class StageUpdate(BaseModel):
     stage: str = Field(..., description="new | contacted | interested | qualified | converted | lost")
-    notes: Optional[str] = Field(None, description="Optional notes about the stage change")
-
-
-class PipelineFunnelStage(BaseModel):
-    stage: str
-    count: int
-    pct: float
+    notes: Optional[str] = None
 
 
 class PipelineSummary(BaseModel):
     total_prospects: int
-    stages: list[PipelineFunnelStage]
+    stages: list[dict]
     conversion_rate: float
 
-
-# ── Tone Analytics ──────────────────────────────────────────────────────
 
 class ToneAnalytics(BaseModel):
     tone: str
@@ -237,3 +230,41 @@ class ToneAnalytics(BaseModel):
     replied: int
     open_rate: float
     reply_rate: float
+
+
+# ── Prospect Activity Log ───────────────────────────────────────────────
+
+class ActivityEntry(BaseModel):
+    type: str
+    timestamp: str
+    detail: str
+    metadata: Optional[dict] = None
+
+
+class ProspectActivity(BaseModel):
+    prospect_id: int
+    prospect_name: str
+    total_events: int
+    activity: list[ActivityEntry]
+
+
+# ── Sequence Clone ──────────────────────────────────────────────────────
+
+class SequenceCloneRequest(BaseModel):
+    new_name: Optional[str] = Field(None, min_length=1, max_length=80)
+
+
+# ── Do-Not-Contact ──────────────────────────────────────────────────────
+
+class DncCreate(BaseModel):
+    email: Optional[str] = Field(None, description="Exact email to block")
+    domain: Optional[str] = Field(None, description="Domain to block (e.g. example.com)")
+    reason: Optional[str] = Field(None, max_length=200)
+
+
+class DncResponse(BaseModel):
+    id: int
+    email: Optional[str]
+    domain: Optional[str]
+    reason: Optional[str]
+    created_at: str
