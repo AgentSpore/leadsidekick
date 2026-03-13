@@ -102,12 +102,32 @@ CREATE TABLE IF NOT EXISTS smart_lists (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS prospect_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prospect_id INTEGER NOT NULL REFERENCES prospects(id) ON DELETE CASCADE,
+    author TEXT NOT NULL,
+    content TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS snippets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'general',
+    times_used INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_prospect ON campaign_events(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_events_sequence ON campaign_events(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_dnc_email ON dnc_list(email);
 CREATE INDEX IF NOT EXISTS idx_dnc_domain ON dnc_list(domain);
 CREATE INDEX IF NOT EXISTS idx_prospects_email ON prospects(email);
 CREATE INDEX IF NOT EXISTS idx_prospects_company ON prospects(company);
+CREATE INDEX IF NOT EXISTS idx_pnotes_prospect ON prospect_notes(prospect_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_snippets_category ON snippets(category);
 
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
@@ -1069,6 +1089,20 @@ async def get_prospect_activity(db: aiosqlite.Connection, prospect_id: int) -> d
             "metadata": {"sequence_id": en["sequence_id"], "status": en["status"]},
         })
 
+    # Prospect notes
+    notes = await db.execute_fetchall(
+        "SELECT * FROM prospect_notes WHERE prospect_id = ? ORDER BY created_at ASC",
+        (prospect_id,),
+    )
+    for n in notes:
+        pin_label = " [pinned]" if n["pinned"] else ""
+        activity.append({
+            "type": "note_added",
+            "timestamp": n["created_at"],
+            "detail": f"Note by {n['author']}{pin_label}: {n['content'][:80]}{'...' if len(n['content']) > 80 else ''}",
+            "metadata": {"note_id": n["id"], "author": n["author"], "pinned": bool(n["pinned"])},
+        })
+
     activity.sort(key=lambda a: a["timestamp"])
 
     return {
@@ -1366,6 +1400,12 @@ async def merge_prospects(db: aiosqlite.Connection, keep_id: int, merge_id: int)
         if not keep.get(field) and merge.get(field):
             await db.execute(f"UPDATE prospects SET {field} = ? WHERE id = ?", (merge[field], keep_id))
 
+    # Transfer prospect_notes
+    await db.execute(
+        "UPDATE prospect_notes SET prospect_id = ? WHERE prospect_id = ?",
+        (keep_id, merge_id),
+    )
+
     # Delete the merged prospect
     await db.execute("DELETE FROM prospects WHERE id = ?", (merge_id,))
     await db.commit()
@@ -1376,4 +1416,212 @@ async def merge_prospects(db: aiosqlite.Connection, keep_id: int, merge_id: int)
         "transferred_drafts": drafts_transferred,
         "transferred_events": events_transferred,
         "transferred_enrollments": enrollments_transferred,
+    }
+
+
+# ── Prospect Notes ───────────────────────────────────────────────────────
+
+def _note_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "prospect_id": r["prospect_id"],
+        "author": r["author"],
+        "content": r["content"],
+        "pinned": bool(r["pinned"]),
+        "created_at": r["created_at"],
+    }
+
+
+async def add_prospect_note(db: aiosqlite.Connection, prospect_id: int,
+                             author: str, content: str) -> dict | None:
+    """Add a threaded note to a prospect. Returns None if prospect does not exist."""
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "INSERT INTO prospect_notes (prospect_id, author, content, pinned, created_at) VALUES (?,?,?,0,?)",
+        (prospect_id, author, content, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM prospect_notes WHERE id = ?", (cur.lastrowid,))
+    return _note_row(rows[0])
+
+
+async def list_prospect_notes(db: aiosqlite.Connection, prospect_id: int) -> list[dict]:
+    """List notes for a prospect: pinned first, then by created_at DESC."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM prospect_notes WHERE prospect_id = ? ORDER BY pinned DESC, created_at DESC",
+        (prospect_id,),
+    )
+    return [_note_row(r) for r in rows]
+
+
+async def delete_prospect_note(db: aiosqlite.Connection, note_id: int) -> bool:
+    cur = await db.execute("DELETE FROM prospect_notes WHERE id = ?", (note_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def toggle_pin_note(db: aiosqlite.Connection, note_id: int) -> dict | None:
+    """Toggle the pinned state of a note. Returns updated note or None if not found."""
+    rows = await db.execute_fetchall("SELECT * FROM prospect_notes WHERE id = ?", (note_id,))
+    if not rows:
+        return None
+    new_pinned = 0 if rows[0]["pinned"] else 1
+    await db.execute("UPDATE prospect_notes SET pinned = ? WHERE id = ?", (new_pinned, note_id))
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM prospect_notes WHERE id = ?", (note_id,))
+    return _note_row(rows[0])
+
+
+# ── Email Snippets ───────────────────────────────────────────────────────
+
+VALID_SNIPPET_CATEGORIES = {"general", "opener", "closer", "value_prop", "social_proof", "cta", "objection_handler"}
+
+
+def _snippet_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "content": r["content"],
+        "category": r["category"],
+        "times_used": r["times_used"],
+        "created_at": r["created_at"],
+    }
+
+
+async def create_snippet(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    category = data.get("category", "general")
+    if category not in VALID_SNIPPET_CATEGORIES:
+        category = "general"
+    cur = await db.execute(
+        "INSERT INTO snippets (name, content, category, times_used, created_at) VALUES (?,?,?,0,?)",
+        (data["name"], data["content"], category, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM snippets WHERE id = ?", (cur.lastrowid,))
+    return _snippet_row(rows[0])
+
+
+async def list_snippets(db: aiosqlite.Connection, category: str | None = None) -> list[dict]:
+    if category:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM snippets WHERE category = ? ORDER BY times_used DESC, name ASC",
+            (category,),
+        )
+    else:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM snippets ORDER BY category ASC, times_used DESC, name ASC"
+        )
+    return [_snippet_row(r) for r in rows]
+
+
+async def get_snippet(db: aiosqlite.Connection, snippet_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM snippets WHERE id = ?", (snippet_id,))
+    return _snippet_row(rows[0]) if rows else None
+
+
+async def delete_snippet(db: aiosqlite.Connection, snippet_id: int) -> bool:
+    cur = await db.execute("DELETE FROM snippets WHERE id = ?", (snippet_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def increment_snippet_usage(db: aiosqlite.Connection, snippet_id: int) -> dict | None:
+    """Increment the times_used counter for a snippet. Returns updated snippet or None."""
+    rows = await db.execute_fetchall("SELECT * FROM snippets WHERE id = ?", (snippet_id,))
+    if not rows:
+        return None
+    await db.execute(
+        "UPDATE snippets SET times_used = times_used + 1 WHERE id = ?", (snippet_id,)
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM snippets WHERE id = ?", (snippet_id,))
+    return _snippet_row(rows[0])
+
+
+# ── Outreach Calendar ────────────────────────────────────────────────────
+
+async def get_outreach_calendar(db: aiosqlite.Connection,
+                                 from_date: str, to_date: str) -> dict:
+    """
+    Return scheduled outreach activities between from_date and to_date (ISO date strings).
+    Looks at active enrollments and computes the next advance date based on
+    last_advanced_at + step delay_days.
+    """
+    from_dt = datetime.fromisoformat(from_date).replace(tzinfo=timezone.utc)
+    # to_date is inclusive: extend to end of that day
+    to_dt = datetime.fromisoformat(to_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+
+    # Load all active enrollments with their sequence info
+    enrollment_rows = await db.execute_fetchall(
+        "SELECT e.*, s.name as seq_name, s.steps as seq_steps FROM enrollments e "
+        "JOIN sequences s ON e.sequence_id = s.id "
+        "WHERE e.status = 'active'"
+    )
+
+    # by_date: date_str -> list of prospect dicts
+    by_date: dict[str, list[dict]] = {}
+    # by_sequence: seq_id -> {id, name, count}
+    by_sequence: dict[int, dict] = {}
+
+    for r in enrollment_rows:
+        steps = jsonlib.loads(r["seq_steps"])
+        step_idx = r["current_step"]
+        if step_idx >= len(steps):
+            continue
+        step = steps[step_idx]
+        ref_time = r["last_advanced_at"] or r["enrolled_at"]
+        ref_dt = datetime.fromisoformat(ref_time)
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+        next_advance_dt = ref_dt + timedelta(days=step["delay_days"])
+
+        # Check if next_advance_dt falls within [from_dt, to_dt)
+        if next_advance_dt < from_dt or next_advance_dt >= to_dt:
+            continue
+
+        date_str = next_advance_dt.date().isoformat()
+
+        prospect = await get_prospect(db, r["prospect_id"])
+        if not prospect:
+            continue
+
+        entry = {
+            "prospect_id": r["prospect_id"],
+            "name": f"{prospect['first_name']} {prospect['last_name']}",
+            "email": prospect["email"],
+            "sequence_name": r["seq_name"],
+            "step_num": step_idx + 1,
+            "subject_hint": step.get("subject_hint", ""),
+        }
+
+        if date_str not in by_date:
+            by_date[date_str] = []
+        by_date[date_str].append(entry)
+
+        seq_id = r["sequence_id"]
+        if seq_id not in by_sequence:
+            by_sequence[seq_id] = {"id": seq_id, "name": r["seq_name"], "scheduled_count": 0}
+        by_sequence[seq_id]["scheduled_count"] += 1
+
+    # Build sorted by_date list (fill in all dates in range with zero if empty is fine,
+    # but only include dates that have prospects for compactness)
+    sorted_dates = sorted(by_date.keys())
+    by_date_list = [
+        {"date": d, "count": len(by_date[d]), "prospects": by_date[d]}
+        for d in sorted_dates
+    ]
+
+    total_scheduled = sum(len(v) for v in by_date.values())
+    by_sequence_list = sorted(by_sequence.values(), key=lambda x: x["scheduled_count"], reverse=True)
+
+    return {
+        "from_date": from_date,
+        "to_date": to_date,
+        "total_scheduled": total_scheduled,
+        "by_date": by_date_list,
+        "by_sequence": by_sequence_list,
     }
