@@ -4,15 +4,16 @@ from typing import Optional
 
 
 class ProspectCreate(BaseModel):
-    first_name: str
-    last_name: str
-    email: str
-    company: str
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    email: str = Field(min_length=3, max_length=200)
+    company: str = Field(min_length=1, max_length=200)
     job_title: Optional[str] = None
     website: Optional[str] = None
     linkedin_url: Optional[str] = None
     notes: Optional[str] = None
     list_id: Optional[int] = None
+    tags: list[str] = Field(default_factory=list, description="Tags for segmentation")
 
 
 class ProspectResponse(BaseModel):
@@ -26,6 +27,7 @@ class ProspectResponse(BaseModel):
     linkedin_url: Optional[str]
     notes: Optional[str]
     list_id: Optional[int]
+    tags: list[str]
     status: str
     created_at: str
 
@@ -33,9 +35,9 @@ class ProspectResponse(BaseModel):
 class DraftRequest(BaseModel):
     prospect_id: int
     template_id: Optional[int] = None
-    tone: str = Field("professional", description="Tone: professional | friendly | direct | witty")
-    context: Optional[str] = Field(None, description="Extra context: their pain, recent news, shared interest")
-    your_value_prop: str = Field(..., description="One-sentence value proposition of your product/service")
+    tone: str = Field("professional", description="professional | friendly | direct | witty")
+    context: Optional[str] = Field(None, description="Custom context about the prospect")
+    value_prop: str = Field(..., description="Value proposition to highlight")
     cta: str = Field("book a 15-min call", description="Call to action")
 
 
@@ -44,8 +46,9 @@ class DraftResponse(BaseModel):
     subject: str
     body: str
     tone: str
-    word_count: int
     personalization_signals: list[str]
+    word_count: int
+    draft_id: int
 
 
 class DraftLogResponse(BaseModel):
@@ -60,11 +63,11 @@ class DraftLogResponse(BaseModel):
 
 
 class TemplateCreate(BaseModel):
-    name: str
-    subject_template: str = Field(..., description="Subject with {{first_name}}, {{company}} placeholders")
-    body_template: str = Field(..., description="Body with {{first_name}}, {{company}}, {{value_prop}}, {{cta}} placeholders")
+    name: str = Field(min_length=1, max_length=120)
+    subject_template: str
+    body_template: str
     tone: str = Field("professional")
-    category: str = Field("cold", description="cold | follow_up | referral | event")
+    category: str = Field("cold", description="cold | warm | followup | nurture")
 
 
 class TemplateResponse(BaseModel):
@@ -79,7 +82,7 @@ class TemplateResponse(BaseModel):
 
 
 class ProspectListCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=120)
     description: Optional[str] = None
 
 
@@ -92,7 +95,7 @@ class ProspectListResponse(BaseModel):
 
 
 class BulkImportRequest(BaseModel):
-    prospects: list[ProspectCreate] = Field(..., min_length=1, max_length=500)
+    prospects: list[ProspectCreate] = Field(min_length=1, max_length=500)
     list_id: Optional[int] = None
 
 
@@ -102,20 +105,20 @@ class UsageStats(BaseModel):
     total_lists: int
     total_templates: int
     total_sequences: int
-    by_status: dict
+    by_status: dict[str, int]
     most_used_tone: Optional[str]
 
 
 class SequenceStep(BaseModel):
-    delay_days: int = Field(ge=0, le=90, description="Days to wait before sending this step")
-    tone: str = Field("professional", description="professional | friendly | direct | witty")
-    subject_hint: str = Field(..., min_length=1, max_length=200, description="Subject line hint for this step")
+    delay_days: int = Field(ge=0, le=90)
+    tone: str = Field("professional")
+    subject_hint: str = Field(min_length=1)
 
 
 class SequenceCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
-    value_prop: str = Field(..., description="Value proposition used in all steps")
-    cta: str = Field("book a 15-min call", description="Call to action")
+    value_prop: str
+    cta: str = Field("book a 15-min call")
     steps: list[SequenceStep] = Field(min_length=1, max_length=10)
 
 
@@ -124,7 +127,7 @@ class SequenceResponse(BaseModel):
     name: str
     value_prop: str
     cta: str
-    steps: list[SequenceStep]
+    steps: list[dict]
     total_enrolled: int
     created_at: str
 
@@ -147,3 +150,39 @@ class AdvanceResult(BaseModel):
     already_complete: int
     not_due: int
     drafts_generated: list[int]
+
+
+# ── Campaign Analytics ───────────────────────────────────────────────────
+
+class CampaignEventCreate(BaseModel):
+    prospect_id: int
+    sequence_id: Optional[int] = None
+    draft_id: Optional[int] = None
+    event_type: str = Field(..., description="sent | opened | replied | bounced | clicked")
+    metadata: Optional[dict] = None
+
+
+class SequenceAnalytics(BaseModel):
+    sequence_id: int
+    sequence_name: str
+    total_enrolled: int
+    completed: int
+    events: dict[str, int]
+    sent: int
+    opened: int
+    replied: int
+    bounced: int
+    open_rate: float
+    reply_rate: float
+    bounce_rate: float
+
+
+class CampaignOverview(BaseModel):
+    total_events: int
+    by_type: dict[str, int]
+    sent: int
+    opened: int
+    replied: int
+    overall_open_rate: float
+    overall_reply_rate: float
+    top_sequences: list[dict]
