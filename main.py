@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
+from datetime import date, timedelta
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,9 @@ from models import (
     SmartListCreate, SmartListResponse,
     EnrollmentActionResult, BulkEnrollmentResult,
     DuplicateGroup, MergeRequest, MergeResult,
+    ProspectNoteCreate, ProspectNoteResponse,
+    SnippetCreate, SnippetResponse,
+    OutreachCalendar,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -41,6 +45,9 @@ from engine import (
     pause_enrollment, resume_enrollment,
     pause_all_enrollments, resume_all_enrollments,
     find_duplicates, merge_prospects,
+    add_prospect_note, list_prospect_notes, delete_prospect_note, toggle_pin_note,
+    create_snippet, list_snippets, get_snippet, delete_snippet, increment_snippet_usage,
+    get_outreach_calendar,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -60,9 +67,10 @@ app = FastAPI(
         "Prospect management, sequences with pause/resume, campaign analytics, "
         "lead scoring, pipeline tracking, tone A/B testing, prospect activity log, "
         "sequence cloning, do-not-contact list, smart lists (saved filters), "
-        "and prospect deduplication with merge."
+        "prospect deduplication with merge, threaded prospect notes with pinning, "
+        "reusable email snippets, and outreach calendar view."
     ),
-    version="0.8.0",
+    version="0.9.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -70,7 +78,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "0.8.0"}
+    return {"status": "ok", "version": "0.9.0"}
 
 
 # ── Smart Lists ─────────────────────────────────────────────────────────
@@ -228,10 +236,42 @@ async def patch_status(prospect_id: int, status: str = Query(...)):
 
 @app.get("/prospects/{prospect_id}/activity", response_model=ProspectActivity)
 async def prospect_activity(prospect_id: int):
-    """Full timeline of all interactions with a prospect."""
+    """Full timeline of all interactions with a prospect (includes notes)."""
     result = await get_prospect_activity(app.state.db, prospect_id)
     if not result:
         raise HTTPException(404, "Prospect not found")
+    return result
+
+
+# ── Prospect Notes ───────────────────────────────────────────────────────
+
+@app.post("/prospects/{prospect_id}/notes", response_model=ProspectNoteResponse, status_code=201)
+async def create_note(prospect_id: int, body: ProspectNoteCreate):
+    """Add a threaded note to a prospect."""
+    result = await add_prospect_note(app.state.db, prospect_id, body.author, body.content)
+    if result is None:
+        raise HTTPException(404, "Prospect not found")
+    return result
+
+
+@app.get("/prospects/{prospect_id}/notes", response_model=list[ProspectNoteResponse])
+async def get_notes(prospect_id: int):
+    """List notes for a prospect. Pinned notes appear first, then by newest first."""
+    return await list_prospect_notes(app.state.db, prospect_id)
+
+
+@app.delete("/prospect-notes/{note_id}", status_code=204)
+async def remove_note(note_id: int):
+    if not await delete_prospect_note(app.state.db, note_id):
+        raise HTTPException(404, "Note not found")
+
+
+@app.post("/prospect-notes/{note_id}/toggle-pin", response_model=ProspectNoteResponse)
+async def toggle_pin(note_id: int):
+    """Toggle the pinned state of a prospect note."""
+    result = await toggle_pin_note(app.state.db, note_id)
+    if result is None:
+        raise HTTPException(404, "Note not found")
     return result
 
 
@@ -454,3 +494,79 @@ async def pipeline_summary():
 async def tone_analytics():
     """Compare tone performance: drafts, open rate, reply rate per tone."""
     return await get_tone_analytics(app.state.db)
+
+
+# ── Email Snippets ───────────────────────────────────────────────────────
+
+@app.post("/snippets", response_model=SnippetResponse, status_code=201)
+async def create_snippet_endpoint(body: SnippetCreate):
+    """Create a reusable email snippet. Valid categories: general, opener, closer, value_prop, social_proof, cta, objection_handler."""
+    from models import SNIPPET_CATEGORIES
+    if body.category not in SNIPPET_CATEGORIES:
+        raise HTTPException(422, f"Invalid category. Must be one of: {', '.join(sorted(SNIPPET_CATEGORIES))}")
+    return await create_snippet(app.state.db, body.model_dump())
+
+
+@app.get("/snippets", response_model=list[SnippetResponse])
+async def list_snippets_endpoint(
+    category: str | None = Query(None, description="Filter by category")
+):
+    """List snippets, optionally filtered by category."""
+    return await list_snippets(app.state.db, category)
+
+
+@app.get("/snippets/{snippet_id}", response_model=SnippetResponse)
+async def get_snippet_endpoint(snippet_id: int):
+    s = await get_snippet(app.state.db, snippet_id)
+    if not s:
+        raise HTTPException(404, "Snippet not found")
+    return s
+
+
+@app.delete("/snippets/{snippet_id}", status_code=204)
+async def delete_snippet_endpoint(snippet_id: int):
+    if not await delete_snippet(app.state.db, snippet_id):
+        raise HTTPException(404, "Snippet not found")
+
+
+@app.post("/snippets/{snippet_id}/use", response_model=SnippetResponse)
+async def use_snippet(snippet_id: int):
+    """Increment the usage counter for a snippet and return the updated snippet."""
+    result = await increment_snippet_usage(app.state.db, snippet_id)
+    if result is None:
+        raise HTTPException(404, "Snippet not found")
+    return result
+
+
+# ── Outreach Calendar ────────────────────────────────────────────────────
+
+@app.get("/calendar", response_model=OutreachCalendar)
+async def outreach_calendar(
+    from_date: str = Query(
+        default=None,
+        description="Start date (ISO format, e.g. 2026-03-13). Defaults to today.",
+    ),
+    to_date: str = Query(
+        default=None,
+        description="End date inclusive (ISO format). Defaults to today + 7 days.",
+    ),
+):
+    """
+    Calendar view of scheduled sequence outreach activities.
+    Returns prospects grouped by the date their next sequence step is due.
+    """
+    today = date.today()
+    if from_date is None:
+        from_date = today.isoformat()
+    if to_date is None:
+        to_date = (today + timedelta(days=7)).isoformat()
+    # Basic validation
+    try:
+        from datetime import datetime as _dt
+        _dt.fromisoformat(from_date)
+        _dt.fromisoformat(to_date)
+    except ValueError:
+        raise HTTPException(422, "Dates must be in ISO format (YYYY-MM-DD)")
+    if from_date > to_date:
+        raise HTTPException(422, "from_date must be <= to_date")
+    return await get_outreach_calendar(app.state.db, from_date, to_date)

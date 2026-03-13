@@ -322,3 +322,70 @@ class MergeResult(BaseModel):
     transferred_drafts: int
     transferred_events: int
     transferred_enrollments: int
+
+
+# ── Prospect Notes ──────────────────────────────────────────────────────
+
+class ProspectNoteCreate(BaseModel):
+    author: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1)
+
+
+class ProspectNoteResponse(BaseModel):
+    id: int
+    prospect_id: int
+    author: str
+    content: str
+    pinned: bool
+    created_at: str
+
+
+# ── Email Snippets ──────────────────────────────────────────────────────
+
+SNIPPET_CATEGORIES = {"general", "opener", "closer", "value_prop", "social_proof", "cta", "objection_handler"}
+
+
+class SnippetCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    content: str = Field(min_length=1)
+    category: str = Field("general", description="general | opener | closer | value_prop | social_proof | cta | objection_handler")
+
+
+class SnippetResponse(BaseModel):
+    id: int
+    name: str
+    content: str
+    category: str
+    times_used: int
+    created_at: str
+
+
+# ── Outreach Calendar ───────────────────────────────────────────────────
+
+class CalendarProspect(BaseModel):
+    prospect_id: int
+    name: str
+    email: str
+    sequence_name: str
+    step_num: int
+    subject_hint: str
+
+
+class CalendarDay(BaseModel):
+    date: str
+    count: int
+    prospects: list[CalendarProspect]
+
+
+class CalendarSequenceSummary(BaseModel):
+    id: int
+    name: str
+    scheduled_count: int
+
+
+class OutreachCalendar(BaseModel):
+    from_date: str
+    to_date: str
+    total_scheduled: int
+    by_date: list[CalendarDay]
+    by_sequence: list[CalendarSequenceSummary]
