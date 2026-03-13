@@ -120,6 +120,53 @@ CREATE TABLE IF NOT EXISTS snippets (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ab_tests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    sequence_id INTEGER REFERENCES sequences(id),
+    variant_a_tone TEXT NOT NULL,
+    variant_a_subject_hint TEXT NOT NULL,
+    variant_b_tone TEXT NOT NULL,
+    variant_b_subject_hint TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    winner TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ab_test_assignments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    test_id INTEGER NOT NULL REFERENCES ab_tests(id),
+    prospect_id INTEGER NOT NULL REFERENCES prospects(id),
+    variant TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(test_id, prospect_id)
+);
+
+CREATE TABLE IF NOT EXISTS segments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT,
+    criteria TEXT NOT NULL,
+    auto_assign INTEGER NOT NULL DEFAULT 0,
+    prospect_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS automation_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    trigger_type TEXT NOT NULL,
+    trigger_config TEXT NOT NULL,
+    action_type TEXT NOT NULL,
+    action_config TEXT NOT NULL,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    times_fired INTEGER NOT NULL DEFAULT 0,
+    last_fired_at TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_prospect ON campaign_events(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_events_sequence ON campaign_events(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_dnc_email ON dnc_list(email);
@@ -128,6 +175,9 @@ CREATE INDEX IF NOT EXISTS idx_prospects_email ON prospects(email);
 CREATE INDEX IF NOT EXISTS idx_prospects_company ON prospects(company);
 CREATE INDEX IF NOT EXISTS idx_pnotes_prospect ON prospect_notes(prospect_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_snippets_category ON snippets(category);
+CREATE INDEX IF NOT EXISTS idx_ab_assignments_test ON ab_test_assignments(test_id);
+CREATE INDEX IF NOT EXISTS idx_segments_auto ON segments(auto_assign);
+CREATE INDEX IF NOT EXISTS idx_automation_trigger ON automation_rules(trigger_type, is_enabled);
 
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
@@ -166,6 +216,10 @@ FOLLOWUP_OPENERS = {
 }
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 async def init_db(path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(path)
     db.row_factory = aiosqlite.Row
@@ -175,6 +229,9 @@ async def init_db(path: str) -> aiosqlite.Connection:
         await db.execute("SELECT tags FROM prospects LIMIT 1")
     except Exception:
         await db.execute("ALTER TABLE prospects ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'")
+    # Migration: ab_tests table (idempotent via CREATE TABLE IF NOT EXISTS in SQL above)
+    # Migration: segments table (idempotent via CREATE TABLE IF NOT EXISTS in SQL above)
+    # Migration: automation_rules table (idempotent via CREATE TABLE IF NOT EXISTS in SQL above)
     await db.commit()
     return db
 
@@ -314,7 +371,7 @@ async def check_dnc(db: aiosqlite.Connection, email: str) -> dict | None:
 
 
 async def add_dnc(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     email = data.get("email", "").lower().strip() or None
     domain = data.get("domain", "").lower().strip() or None
     cur = await db.execute(
@@ -348,7 +405,7 @@ async def create_prospect(db: aiosqlite.Connection, data: dict) -> dict | str:
     if dnc:
         blocked_by = dnc.get("email") or dnc.get("domain")
         return f"blocked_by_dnc:{blocked_by}"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     tags_json = jsonlib.dumps(data.get("tags", []))
     cur = await db.execute(
         """INSERT INTO prospects (first_name, last_name, email, company, job_title, website,
@@ -386,8 +443,17 @@ async def get_prospect(db: aiosqlite.Connection, prospect_id: int) -> dict | Non
 
 
 async def update_prospect_status(db: aiosqlite.Connection, prospect_id: int, status: str) -> dict | None:
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return None
+    old_status = prospect["status"]
     await db.execute("UPDATE prospects SET status = ? WHERE id = ?", (status, prospect_id))
     await db.commit()
+    # Trigger automation for status_change
+    await evaluate_automation_for_prospect(
+        db, prospect_id, "status_change",
+        {"from_status": old_status, "to_status": status},
+    )
     return await get_prospect(db, prospect_id)
 
 
@@ -427,7 +493,7 @@ async def create_draft(db: aiosqlite.Connection, prospect_id: int, template_id: 
             draft["word_count"] = len(draft["body"].split())
             await db.execute("UPDATE templates SET times_used = times_used + 1 WHERE id = ?", (template_id,))
 
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO draft_log (prospect_id, template_id, tone, subject, body, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (prospect_id, template_id, tone, draft["subject"], draft["body"], now)
@@ -438,7 +504,7 @@ async def create_draft(db: aiosqlite.Connection, prospect_id: int, template_id: 
 
 
 async def create_template(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO templates (name, subject_template, body_template, tone, category, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         (data["name"], data["subject_template"], data["body_template"],
@@ -455,7 +521,7 @@ async def list_templates(db: aiosqlite.Connection) -> list[dict]:
 
 
 async def create_prospect_list(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO prospect_lists (name, description, created_at) VALUES (?, ?, ?)",
         (data["name"], data.get("description"), now)
@@ -488,6 +554,9 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     total_s = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM sequences"))[0]["cnt"]
     total_dnc = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM dnc_list"))[0]["cnt"]
     total_sl = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM smart_lists"))[0]["cnt"]
+    total_seg = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM segments"))[0]["cnt"]
+    total_ab = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM ab_tests"))[0]["cnt"]
+    total_auto = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM automation_rules"))[0]["cnt"]
     stats_row = await db.execute_fetchall("SELECT * FROM usage_stats WHERE id = 1")
     total_drafts = stats_row[0]["total_drafts"] if stats_row else 0
     status_rows = await db.execute_fetchall("SELECT status, COUNT(*) as cnt FROM prospects GROUP BY status")
@@ -499,6 +568,9 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "total_lists": total_l, "total_templates": total_t,
         "total_sequences": total_s, "total_dnc_entries": total_dnc,
         "total_smart_lists": total_sl,
+        "total_segments": total_seg,
+        "total_ab_tests": total_ab,
+        "total_automation_rules": total_auto,
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
 
@@ -562,7 +634,7 @@ async def export_prospects_csv(db: aiosqlite.Connection,
 # ── Sequences ─────────────────────────────────────────────────────────────
 
 async def create_sequence(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     steps_json = jsonlib.dumps(data["steps"])
     cur = await db.execute(
         "INSERT INTO sequences (name, value_prop, cta, steps, created_at) VALUES (?,?,?,?,?)",
@@ -606,7 +678,7 @@ async def clone_sequence(db: aiosqlite.Connection, seq_id: int,
     src = await _get_sequence(db, seq_id)
     if not src:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     name = new_name or f"{src['name']} (copy)"
     cur = await db.execute(
         "INSERT INTO sequences (name, value_prop, cta, steps, created_at) VALUES (?,?,?,?,?)",
@@ -631,7 +703,7 @@ async def enroll_prospect(db: aiosqlite.Connection, seq_id: int, prospect_id: in
         "SELECT id FROM enrollments WHERE sequence_id=? AND prospect_id=?", (seq_id, prospect_id))
     if existing:
         return "already_enrolled"
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO enrollments (sequence_id, prospect_id, current_step, status, enrolled_at) VALUES (?,?,0,'active',?)",
         (seq_id, prospect_id, now),
@@ -701,6 +773,11 @@ async def advance_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None
         if step_idx >= len(steps):
             await db.execute("UPDATE enrollments SET status='completed' WHERE id=?", (r["id"],))
             already_complete += 1
+            # Trigger automation: enrollment_completed
+            await evaluate_automation_for_prospect(
+                db, r["prospect_id"], "enrollment_completed",
+                {"sequence_id": seq_id},
+            )
             continue
 
         step = steps[step_idx]
@@ -734,6 +811,13 @@ async def advance_sequence(db: aiosqlite.Connection, seq_id: int) -> dict | None
             (next_step, new_status, now_iso, r["id"]),
         )
         advanced += 1
+
+        # If enrollment just completed, trigger automation
+        if new_status == "completed":
+            await evaluate_automation_for_prospect(
+                db, r["prospect_id"], "enrollment_completed",
+                {"sequence_id": seq_id},
+            )
 
     await db.commit()
     return {
@@ -775,13 +859,18 @@ async def remove_prospect_tag(db: aiosqlite.Connection, prospect_id: int, tag: s
 # ── Campaign Events ──────────────────────────────────────────────────────
 
 async def record_event(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO campaign_events (prospect_id, sequence_id, draft_id, event_type, metadata, created_at) VALUES (?,?,?,?,?,?)",
         (data["prospect_id"], data.get("sequence_id"), data.get("draft_id"),
          data["event_type"], jsonlib.dumps(data.get("metadata")) if data.get("metadata") else None, now),
     )
     await db.commit()
+    # Trigger automation: event_received
+    await evaluate_automation_for_prospect(
+        db, data["prospect_id"], "event_received",
+        {"event_type": data["event_type"]},
+    )
     return {"id": cur.lastrowid, "event_type": data["event_type"], "created_at": now}
 
 
@@ -956,13 +1045,18 @@ async def update_prospect_stage(db: aiosqlite.Connection, prospect_id: int,
         return None
     old_stage = prospect["status"]
     await db.execute("UPDATE prospects SET status = ? WHERE id = ?", (stage, prospect_id))
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         "INSERT INTO campaign_events (prospect_id, sequence_id, draft_id, event_type, metadata, created_at) VALUES (?,?,?,?,?,?)",
         (prospect_id, None, None, "stage_change",
          jsonlib.dumps({"from": old_stage, "to": stage, "notes": notes}), now),
     )
     await db.commit()
+    # Trigger automation for status_change
+    await evaluate_automation_for_prospect(
+        db, prospect_id, "status_change",
+        {"from_status": old_stage, "to_status": stage},
+    )
     return await get_prospect(db, prospect_id)
 
 
@@ -1163,7 +1257,7 @@ async def _smart_list_prospects(db: aiosqlite.Connection, filters: dict) -> list
 
 
 async def create_smart_list(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     filters = data["filters"]
     cur = await db.execute(
         "INSERT INTO smart_lists (name, filters, created_at) VALUES (?,?,?)",
@@ -1249,7 +1343,7 @@ async def resume_enrollment(db: aiosqlite.Connection, enrollment_id: int) -> dic
     if r["status"] != "paused":
         return {"enrollment_id": enrollment_id, "status": r["status"],
                 "message": f"Cannot resume: enrollment is {r['status']}"}
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     await db.execute(
         "UPDATE enrollments SET status = 'active', last_advanced_at = ? WHERE id = ?",
         (now, enrollment_id),
@@ -1274,7 +1368,7 @@ async def resume_all_enrollments(db: aiosqlite.Connection, seq_id: int) -> dict 
     seq = await _get_sequence(db, seq_id)
     if not seq:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "UPDATE enrollments SET status = 'active', last_advanced_at = ? WHERE sequence_id = ? AND status = 'paused'",
         (now, seq_id),
@@ -1406,6 +1500,15 @@ async def merge_prospects(db: aiosqlite.Connection, keep_id: int, merge_id: int)
         (keep_id, merge_id),
     )
 
+    # Transfer AB test assignments
+    await db.execute(
+        "UPDATE OR IGNORE ab_test_assignments SET prospect_id = ? WHERE prospect_id = ?",
+        (keep_id, merge_id),
+    )
+    await db.execute(
+        "DELETE FROM ab_test_assignments WHERE prospect_id = ?", (merge_id,),
+    )
+
     # Delete the merged prospect
     await db.execute("DELETE FROM prospects WHERE id = ?", (merge_id,))
     await db.commit()
@@ -1438,7 +1541,7 @@ async def add_prospect_note(db: aiosqlite.Connection, prospect_id: int,
     prospect = await get_prospect(db, prospect_id)
     if not prospect:
         return None
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     cur = await db.execute(
         "INSERT INTO prospect_notes (prospect_id, author, content, pinned, created_at) VALUES (?,?,?,0,?)",
         (prospect_id, author, content, now),
@@ -1492,7 +1595,7 @@ def _snippet_row(r: aiosqlite.Row) -> dict:
 
 
 async def create_snippet(db: aiosqlite.Connection, data: dict) -> dict:
-    now = datetime.now(timezone.utc).isoformat()
+    now = _now()
     category = data.get("category", "general")
     if category not in VALID_SNIPPET_CATEGORIES:
         category = "general"
@@ -1625,3 +1728,587 @@ async def get_outreach_calendar(db: aiosqlite.Connection,
         "by_date": by_date_list,
         "by_sequence": by_sequence_list,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 1: Email A/B Testing (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _ab_test_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "sequence_id": r["sequence_id"],
+        "variant_a_tone": r["variant_a_tone"],
+        "variant_a_subject_hint": r["variant_a_subject_hint"],
+        "variant_b_tone": r["variant_b_tone"],
+        "variant_b_subject_hint": r["variant_b_subject_hint"],
+        "status": r["status"],
+        "winner": r["winner"],
+        "created_at": r["created_at"],
+        "completed_at": r["completed_at"],
+    }
+
+
+async def _compute_variant_stats(db: aiosqlite.Connection, test_id: int, variant: str) -> dict:
+    """Compute stats for a single variant of an A/B test from campaign_events."""
+    # Get all prospect_ids assigned to this variant
+    assignment_rows = await db.execute_fetchall(
+        "SELECT prospect_id FROM ab_test_assignments WHERE test_id = ? AND variant = ?",
+        (test_id, variant),
+    )
+    prospect_ids = [r["prospect_id"] for r in assignment_rows]
+    if not prospect_ids:
+        return {"sent": 0, "opened": 0, "replied": 0, "open_rate": 0.0, "reply_rate": 0.0}
+
+    placeholders = ",".join("?" * len(prospect_ids))
+    event_rows = await db.execute_fetchall(
+        f"SELECT event_type, COUNT(*) as cnt FROM campaign_events "
+        f"WHERE prospect_id IN ({placeholders}) GROUP BY event_type",
+        prospect_ids,
+    )
+    ev = {r["event_type"]: r["cnt"] for r in event_rows}
+    sent = ev.get("sent", 0)
+    opened = ev.get("opened", 0)
+    replied = ev.get("replied", 0)
+    return {
+        "sent": sent,
+        "opened": opened,
+        "replied": replied,
+        "open_rate": round(opened / max(sent, 1) * 100, 1),
+        "reply_rate": round(replied / max(sent, 1) * 100, 1),
+    }
+
+
+async def create_ab_test(db: aiosqlite.Connection, data: dict) -> dict:
+    now = _now()
+    cur = await db.execute(
+        """INSERT INTO ab_tests (name, sequence_id, variant_a_tone, variant_a_subject_hint,
+           variant_b_tone, variant_b_subject_hint, status, winner, created_at, completed_at)
+           VALUES (?,?,?,?,?,?,'running',NULL,?,NULL)""",
+        (data["name"], data.get("sequence_id"),
+         data["variant_a_tone"], data["variant_a_subject_hint"],
+         data["variant_b_tone"], data["variant_b_subject_hint"], now),
+    )
+    await db.commit()
+    return await get_ab_test(db, cur.lastrowid)
+
+
+async def list_ab_tests(db: aiosqlite.Connection, status: str | None = None) -> list[dict]:
+    if status:
+        rows = await db.execute_fetchall(
+            "SELECT * FROM ab_tests WHERE status = ? ORDER BY created_at DESC", (status,))
+    else:
+        rows = await db.execute_fetchall("SELECT * FROM ab_tests ORDER BY created_at DESC")
+    result = []
+    for r in rows:
+        test = _ab_test_row(r)
+        test["variant_a_stats"] = await _compute_variant_stats(db, r["id"], "a")
+        test["variant_b_stats"] = await _compute_variant_stats(db, r["id"], "b")
+        result.append(test)
+    return result
+
+
+async def get_ab_test(db: aiosqlite.Connection, test_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM ab_tests WHERE id = ?", (test_id,))
+    if not rows:
+        return None
+    test = _ab_test_row(rows[0])
+    test["variant_a_stats"] = await _compute_variant_stats(db, test_id, "a")
+    test["variant_b_stats"] = await _compute_variant_stats(db, test_id, "b")
+    return test
+
+
+async def assign_prospect_to_test(db: aiosqlite.Connection, test_id: int,
+                                    prospect_id: int, variant: str | None = None) -> dict | str | None:
+    """Assign a prospect to an A/B test variant. Auto round-robin if variant not specified."""
+    rows = await db.execute_fetchall("SELECT * FROM ab_tests WHERE id = ?", (test_id,))
+    if not rows:
+        return None
+    test = rows[0]
+    if test["status"] != "running":
+        return "test_not_running"
+
+    # Check prospect exists
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return "prospect_not_found"
+
+    # DNC check
+    dnc = await check_dnc(db, prospect["email"])
+    if dnc:
+        return "dnc_blocked"
+
+    # Check for existing assignment
+    existing = await db.execute_fetchall(
+        "SELECT id FROM ab_test_assignments WHERE test_id = ? AND prospect_id = ?",
+        (test_id, prospect_id),
+    )
+    if existing:
+        return "already_assigned"
+
+    # Auto round-robin if variant not specified
+    if not variant:
+        count_a = (await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM ab_test_assignments WHERE test_id = ? AND variant = 'a'",
+            (test_id,)))[0]["c"]
+        count_b = (await db.execute_fetchall(
+            "SELECT COUNT(*) as c FROM ab_test_assignments WHERE test_id = ? AND variant = 'b'",
+            (test_id,)))[0]["c"]
+        variant = "a" if count_a <= count_b else "b"
+
+    if variant not in ("a", "b"):
+        return "invalid_variant"
+
+    now = _now()
+    cur = await db.execute(
+        "INSERT INTO ab_test_assignments (test_id, prospect_id, variant, created_at) VALUES (?,?,?,?)",
+        (test_id, prospect_id, variant, now),
+    )
+    await db.commit()
+    return {
+        "id": cur.lastrowid,
+        "test_id": test_id,
+        "prospect_id": prospect_id,
+        "variant": variant,
+        "created_at": now,
+    }
+
+
+async def complete_ab_test(db: aiosqlite.Connection, test_id: int,
+                             winner: str | None = None) -> dict | str | None:
+    """Complete an A/B test. Auto-determine winner by reply_rate if not specified."""
+    rows = await db.execute_fetchall("SELECT * FROM ab_tests WHERE id = ?", (test_id,))
+    if not rows:
+        return None
+    test = rows[0]
+    if test["status"] != "running":
+        return "test_not_running"
+
+    now = _now()
+
+    if winner and winner in ("a", "b"):
+        final_winner = winner
+    else:
+        # Auto-determine by reply_rate
+        stats_a = await _compute_variant_stats(db, test_id, "a")
+        stats_b = await _compute_variant_stats(db, test_id, "b")
+        if stats_a["reply_rate"] > stats_b["reply_rate"]:
+            final_winner = "a"
+        elif stats_b["reply_rate"] > stats_a["reply_rate"]:
+            final_winner = "b"
+        else:
+            final_winner = "tie"
+
+    await db.execute(
+        "UPDATE ab_tests SET status = 'completed', winner = ?, completed_at = ? WHERE id = ?",
+        (final_winner, now, test_id),
+    )
+    await db.commit()
+    return await get_ab_test(db, test_id)
+
+
+async def list_test_assignments(db: aiosqlite.Connection, test_id: int) -> list[dict] | None:
+    """List all prospect assignments for a test."""
+    rows = await db.execute_fetchall("SELECT * FROM ab_tests WHERE id = ?", (test_id,))
+    if not rows:
+        return None
+    assignment_rows = await db.execute_fetchall(
+        "SELECT * FROM ab_test_assignments WHERE test_id = ? ORDER BY created_at DESC",
+        (test_id,),
+    )
+    return [
+        {
+            "id": r["id"],
+            "test_id": r["test_id"],
+            "prospect_id": r["prospect_id"],
+            "variant": r["variant"],
+            "created_at": r["created_at"],
+        }
+        for r in assignment_rows
+    ]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 2: Prospect Segments (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _segment_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "description": r["description"],
+        "criteria": jsonlib.loads(r["criteria"]) if r["criteria"] else {},
+        "auto_assign": bool(r["auto_assign"]),
+        "prospect_count": r["prospect_count"],
+        "created_at": r["created_at"],
+    }
+
+
+async def _evaluate_segment_criteria(db: aiosqlite.Connection, criteria: dict) -> list[dict]:
+    """Evaluate segment criteria and return matching prospects with scores."""
+    # Start with all prospects
+    rows = await db.execute_fetchall("SELECT * FROM prospects ORDER BY created_at DESC")
+    prospects = [_prospect_row(r) for r in rows]
+
+    matched = []
+    for p in prospects:
+        # Compute lead score for this prospect
+        score_data = await compute_lead_score(db, p["id"])
+        score = score_data["score"] if score_data else 0
+        grade = score_data["grade"] if score_data else "cold"
+
+        # Apply criteria filters
+        if "score_min" in criteria and criteria["score_min"] is not None:
+            if score < criteria["score_min"]:
+                continue
+        if "score_max" in criteria and criteria["score_max"] is not None:
+            if score > criteria["score_max"]:
+                continue
+
+        if "min_events" in criteria and criteria["min_events"] is not None:
+            event_count_rows = await db.execute_fetchall(
+                "SELECT COUNT(*) as cnt FROM campaign_events WHERE prospect_id = ?",
+                (p["id"],),
+            )
+            event_count = event_count_rows[0]["cnt"] if event_count_rows else 0
+            if event_count < criteria["min_events"]:
+                continue
+
+        if "status" in criteria and criteria["status"] is not None:
+            if p["status"] != criteria["status"]:
+                continue
+
+        if "has_tag" in criteria and criteria["has_tag"] is not None:
+            tag = criteria["has_tag"].strip().lower()
+            tags = [t.lower() for t in p.get("tags", [])]
+            if tag not in tags:
+                continue
+
+        if "company_contains" in criteria and criteria["company_contains"] is not None:
+            if criteria["company_contains"].lower() not in p["company"].lower():
+                continue
+
+        if "enrolled_in_sequence" in criteria and criteria["enrolled_in_sequence"] is not None:
+            enroll_rows = await db.execute_fetchall(
+                "SELECT COUNT(*) as cnt FROM enrollments WHERE prospect_id = ?",
+                (p["id"],),
+            )
+            has_enrollment = (enroll_rows[0]["cnt"] if enroll_rows else 0) > 0
+            if criteria["enrolled_in_sequence"] and not has_enrollment:
+                continue
+            if not criteria["enrolled_in_sequence"] and has_enrollment:
+                continue
+
+        matched.append({
+            "prospect_id": p["id"],
+            "name": f"{p['first_name']} {p['last_name']}",
+            "email": p["email"],
+            "company": p["company"],
+            "score": score,
+            "grade": grade,
+        })
+
+    return matched
+
+
+async def create_segment(db: aiosqlite.Connection, data: dict) -> dict:
+    now = _now()
+    criteria = data["criteria"]
+    auto_assign = 1 if data.get("auto_assign") else 0
+    # Evaluate initial prospect count
+    matched = await _evaluate_segment_criteria(db, criteria)
+    cur = await db.execute(
+        """INSERT INTO segments (name, description, criteria, auto_assign, prospect_count, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (data["name"], data.get("description"), jsonlib.dumps(criteria),
+         auto_assign, len(matched), now, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM segments WHERE id = ?", (cur.lastrowid,))
+    return _segment_row(rows[0])
+
+
+async def list_segments(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM segments ORDER BY created_at DESC")
+    return [_segment_row(r) for r in rows]
+
+
+async def get_segment(db: aiosqlite.Connection, segment_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM segments WHERE id = ?", (segment_id,))
+    return _segment_row(rows[0]) if rows else None
+
+
+async def update_segment(db: aiosqlite.Connection, segment_id: int, data: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM segments WHERE id = ?", (segment_id,))
+    if not rows:
+        return None
+    now = _now()
+    r = rows[0]
+    name = data.get("name") or r["name"]
+    description = data.get("description") if "description" in data else r["description"]
+    criteria = data.get("criteria") or jsonlib.loads(r["criteria"])
+    auto_assign = data.get("auto_assign") if "auto_assign" in data and data["auto_assign"] is not None else bool(r["auto_assign"])
+    auto_assign_int = 1 if auto_assign else 0
+
+    await db.execute(
+        """UPDATE segments SET name=?, description=?, criteria=?, auto_assign=?, updated_at=?
+           WHERE id=?""",
+        (name, description, jsonlib.dumps(criteria), auto_assign_int, now, segment_id),
+    )
+    await db.commit()
+    return await get_segment(db, segment_id)
+
+
+async def delete_segment(db: aiosqlite.Connection, segment_id: int) -> bool:
+    cur = await db.execute("DELETE FROM segments WHERE id = ?", (segment_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def evaluate_segment(db: aiosqlite.Connection, segment_id: int) -> dict | None:
+    """Re-compute matching prospects for a segment and update prospect_count."""
+    rows = await db.execute_fetchall("SELECT * FROM segments WHERE id = ?", (segment_id,))
+    if not rows:
+        return None
+    criteria = jsonlib.loads(rows[0]["criteria"])
+    matched = await _evaluate_segment_criteria(db, criteria)
+    now = _now()
+    await db.execute(
+        "UPDATE segments SET prospect_count = ?, updated_at = ? WHERE id = ?",
+        (len(matched), now, segment_id),
+    )
+    await db.commit()
+    return await get_segment(db, segment_id)
+
+
+async def list_segment_prospects(db: aiosqlite.Connection, segment_id: int) -> list[dict] | None:
+    """Get all prospects matching a segment's criteria with their scores."""
+    rows = await db.execute_fetchall("SELECT * FROM segments WHERE id = ?", (segment_id,))
+    if not rows:
+        return None
+    criteria = jsonlib.loads(rows[0]["criteria"])
+    return await _evaluate_segment_criteria(db, criteria)
+
+
+async def auto_assign_segments(db: aiosqlite.Connection) -> dict:
+    """Re-evaluate all auto_assign segments and update their prospect_count."""
+    rows = await db.execute_fetchall(
+        "SELECT * FROM segments WHERE auto_assign = 1 ORDER BY id")
+    updated = 0
+    for r in rows:
+        criteria = jsonlib.loads(r["criteria"])
+        matched = await _evaluate_segment_criteria(db, criteria)
+        now = _now()
+        await db.execute(
+            "UPDATE segments SET prospect_count = ?, updated_at = ? WHERE id = ?",
+            (len(matched), now, r["id"]),
+        )
+        updated += 1
+    await db.commit()
+    return {"segments_updated": updated}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Feature 3: Outreach Automation Rules (v1.0.0)
+# ══════════════════════════════════════════════════════════════════════════
+
+VALID_TRIGGER_TYPES = {"status_change", "event_received", "score_threshold", "enrollment_completed"}
+VALID_ACTION_TYPES = {"enroll_in_sequence", "add_tag", "remove_tag", "change_status", "pause_enrollment"}
+
+
+def _automation_rule_row(r: aiosqlite.Row) -> dict:
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "trigger_type": r["trigger_type"],
+        "trigger_config": jsonlib.loads(r["trigger_config"]) if r["trigger_config"] else {},
+        "action_type": r["action_type"],
+        "action_config": jsonlib.loads(r["action_config"]) if r["action_config"] else {},
+        "is_enabled": bool(r["is_enabled"]),
+        "times_fired": r["times_fired"],
+        "last_fired_at": r["last_fired_at"],
+        "created_at": r["created_at"],
+    }
+
+
+async def create_automation_rule(db: aiosqlite.Connection, data: dict) -> dict:
+    now = _now()
+    is_enabled = 1 if data.get("is_enabled", True) else 0
+    cur = await db.execute(
+        """INSERT INTO automation_rules
+           (name, trigger_type, trigger_config, action_type, action_config, is_enabled, times_fired, last_fired_at, created_at)
+           VALUES (?,?,?,?,?,?,0,NULL,?)""",
+        (data["name"], data["trigger_type"], jsonlib.dumps(data["trigger_config"]),
+         data["action_type"], jsonlib.dumps(data["action_config"]), is_enabled, now),
+    )
+    await db.commit()
+    rows = await db.execute_fetchall("SELECT * FROM automation_rules WHERE id = ?", (cur.lastrowid,))
+    return _automation_rule_row(rows[0])
+
+
+async def list_automation_rules(db: aiosqlite.Connection,
+                                  is_enabled: bool | None = None,
+                                  trigger_type: str | None = None) -> list[dict]:
+    q = "SELECT * FROM automation_rules WHERE 1=1"
+    params: list = []
+    if is_enabled is not None:
+        q += " AND is_enabled = ?"
+        params.append(1 if is_enabled else 0)
+    if trigger_type:
+        q += " AND trigger_type = ?"
+        params.append(trigger_type)
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_automation_rule_row(r) for r in rows]
+
+
+async def get_automation_rule(db: aiosqlite.Connection, rule_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM automation_rules WHERE id = ?", (rule_id,))
+    return _automation_rule_row(rows[0]) if rows else None
+
+
+async def update_automation_rule(db: aiosqlite.Connection, rule_id: int, data: dict) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM automation_rules WHERE id = ?", (rule_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    name = data.get("name") or r["name"]
+    trigger_config = jsonlib.dumps(data["trigger_config"]) if "trigger_config" in data and data["trigger_config"] is not None else r["trigger_config"]
+    action_config = jsonlib.dumps(data["action_config"]) if "action_config" in data and data["action_config"] is not None else r["action_config"]
+    is_enabled = (1 if data["is_enabled"] else 0) if "is_enabled" in data and data["is_enabled"] is not None else r["is_enabled"]
+
+    await db.execute(
+        """UPDATE automation_rules SET name=?, trigger_config=?, action_config=?, is_enabled=?
+           WHERE id=?""",
+        (name, trigger_config, action_config, is_enabled, rule_id),
+    )
+    await db.commit()
+    return await get_automation_rule(db, rule_id)
+
+
+async def delete_automation_rule(db: aiosqlite.Connection, rule_id: int) -> bool:
+    cur = await db.execute("DELETE FROM automation_rules WHERE id = ?", (rule_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+async def _execute_automation_action(db: aiosqlite.Connection, prospect_id: int,
+                                       action_type: str, action_config: dict) -> bool:
+    """Execute a single automation action on a prospect. Returns True if action was executed."""
+    if action_type == "enroll_in_sequence":
+        seq_id = action_config.get("sequence_id")
+        if seq_id:
+            result = await enroll_prospect(db, seq_id, prospect_id)
+            # Only count as fired if enrollment succeeded (not already enrolled, not blocked, etc.)
+            return isinstance(result, dict)
+        return False
+
+    elif action_type == "add_tag":
+        tag = action_config.get("tag")
+        if tag:
+            result = await add_prospect_tag(db, prospect_id, tag)
+            return result is not None
+        return False
+
+    elif action_type == "remove_tag":
+        tag = action_config.get("tag")
+        if tag:
+            result = await remove_prospect_tag(db, prospect_id, tag)
+            return result is not None
+        return False
+
+    elif action_type == "change_status":
+        status = action_config.get("status")
+        if status:
+            # Use direct SQL to avoid infinite recursion via update_prospect_status triggering automation
+            await db.execute("UPDATE prospects SET status = ? WHERE id = ?", (status, prospect_id))
+            await db.commit()
+            return True
+        return False
+
+    elif action_type == "pause_enrollment":
+        seq_id = action_config.get("sequence_id")
+        if seq_id:
+            # Pause enrollment for specific sequence
+            enroll_rows = await db.execute_fetchall(
+                "SELECT id FROM enrollments WHERE prospect_id = ? AND sequence_id = ? AND status = 'active'",
+                (prospect_id, seq_id),
+            )
+            for er in enroll_rows:
+                await pause_enrollment(db, er["id"])
+            return len(enroll_rows) > 0
+        else:
+            # Pause all active enrollments for this prospect
+            enroll_rows = await db.execute_fetchall(
+                "SELECT id FROM enrollments WHERE prospect_id = ? AND status = 'active'",
+                (prospect_id,),
+            )
+            for er in enroll_rows:
+                await pause_enrollment(db, er["id"])
+            return len(enroll_rows) > 0
+
+    return False
+
+
+async def evaluate_automation_for_prospect(db: aiosqlite.Connection, prospect_id: int,
+                                             trigger_type: str, trigger_data: dict) -> list[int]:
+    """
+    Check all enabled rules matching trigger_type, execute matching actions,
+    increment times_fired. Returns list of fired rule IDs.
+    """
+    rules = await db.execute_fetchall(
+        "SELECT * FROM automation_rules WHERE trigger_type = ? AND is_enabled = 1",
+        (trigger_type,),
+    )
+
+    fired_rule_ids = []
+
+    for r in rules:
+        config = jsonlib.loads(r["trigger_config"]) if r["trigger_config"] else {}
+        match = False
+
+        if trigger_type == "status_change":
+            from_status = config.get("from_status")
+            to_status = config.get("to_status")
+            # Match if config conditions are met (None means any)
+            from_ok = from_status is None or from_status == trigger_data.get("from_status")
+            to_ok = to_status is None or to_status == trigger_data.get("to_status")
+            match = from_ok and to_ok
+
+        elif trigger_type == "event_received":
+            event_type = config.get("event_type")
+            match = event_type is None or event_type == trigger_data.get("event_type")
+
+        elif trigger_type == "score_threshold":
+            # Need to compute current score
+            score_data = await compute_lead_score(db, prospect_id)
+            if score_data:
+                score = score_data["score"]
+                min_score = config.get("min_score")
+                max_score = config.get("max_score")
+                min_ok = min_score is None or score >= min_score
+                max_ok = max_score is None or score <= max_score
+                match = min_ok and max_ok
+
+        elif trigger_type == "enrollment_completed":
+            seq_id = config.get("sequence_id")
+            match = seq_id is None or seq_id == trigger_data.get("sequence_id")
+
+        if not match:
+            continue
+
+        action_type = r["action_type"]
+        action_config = jsonlib.loads(r["action_config"]) if r["action_config"] else {}
+
+        executed = await _execute_automation_action(db, prospect_id, action_type, action_config)
+        if executed:
+            now = _now()
+            await db.execute(
+                "UPDATE automation_rules SET times_fired = times_fired + 1, last_fired_at = ? WHERE id = ?",
+                (now, r["id"]),
+            )
+            await db.commit()
+            fired_rule_ids.append(r["id"])
+
+    return fired_rule_ids
