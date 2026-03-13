@@ -95,10 +95,19 @@ CREATE TABLE IF NOT EXISTS dnc_list (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS smart_lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    filters TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_events_prospect ON campaign_events(prospect_id);
 CREATE INDEX IF NOT EXISTS idx_events_sequence ON campaign_events(sequence_id);
 CREATE INDEX IF NOT EXISTS idx_dnc_email ON dnc_list(email);
 CREATE INDEX IF NOT EXISTS idx_dnc_domain ON dnc_list(domain);
+CREATE INDEX IF NOT EXISTS idx_prospects_email ON prospects(email);
+CREATE INDEX IF NOT EXISTS idx_prospects_company ON prospects(company);
 
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
@@ -458,6 +467,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     total_t = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM templates"))[0]["cnt"]
     total_s = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM sequences"))[0]["cnt"]
     total_dnc = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM dnc_list"))[0]["cnt"]
+    total_sl = (await db.execute_fetchall("SELECT COUNT(*) as cnt FROM smart_lists"))[0]["cnt"]
     stats_row = await db.execute_fetchall("SELECT * FROM usage_stats WHERE id = 1")
     total_drafts = stats_row[0]["total_drafts"] if stats_row else 0
     status_rows = await db.execute_fetchall("SELECT status, COUNT(*) as cnt FROM prospects GROUP BY status")
@@ -468,6 +478,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "total_prospects": total_p, "total_drafts_generated": total_drafts,
         "total_lists": total_l, "total_templates": total_t,
         "total_sequences": total_s, "total_dnc_entries": total_dnc,
+        "total_smart_lists": total_sl,
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
 
@@ -1031,7 +1042,7 @@ async def get_prospect_activity(db: aiosqlite.Connection, prospect_id: int) -> d
     for e in events:
         meta = jsonlib.loads(e["metadata"]) if e["metadata"] else {}
         if e["event_type"] == "stage_change":
-            detail = f"Stage: {meta.get('from', '?')} → {meta.get('to', '?')}"
+            detail = f"Stage: {meta.get('from', '?')} -> {meta.get('to', '?')}"
             if meta.get("notes"):
                 detail += f" ({meta['notes']})"
         else:
@@ -1065,4 +1076,304 @@ async def get_prospect_activity(db: aiosqlite.Connection, prospect_id: int) -> d
         "prospect_name": f"{prospect['first_name']} {prospect['last_name']}",
         "total_events": len(activity),
         "activity": activity,
+    }
+
+
+# ── Smart Lists ──────────────────────────────────────────────────────────
+
+async def _smart_list_count(db: aiosqlite.Connection, filters: dict) -> int:
+    """Count prospects matching smart list filters."""
+    q = "SELECT COUNT(*) as cnt FROM prospects WHERE 1=1"
+    params: list = []
+    if filters.get("status"):
+        q += " AND status = ?"
+        params.append(filters["status"])
+    if filters.get("list_id") is not None:
+        q += " AND list_id = ?"
+        params.append(filters["list_id"])
+    if filters.get("tag"):
+        q += " AND tags LIKE ?"
+        params.append(f'%"{filters["tag"]}"%')
+    if filters.get("company_contains"):
+        q += " AND company LIKE ?"
+        params.append(f'%{filters["company_contains"]}%')
+    if filters.get("job_title_contains"):
+        q += " AND job_title LIKE ?"
+        params.append(f'%{filters["job_title_contains"]}%')
+    rows = await db.execute_fetchall(q, params)
+    return rows[0]["cnt"] if rows else 0
+
+
+async def _smart_list_prospects(db: aiosqlite.Connection, filters: dict) -> list[dict]:
+    """Get prospects matching smart list filters."""
+    q = "SELECT * FROM prospects WHERE 1=1"
+    params: list = []
+    if filters.get("status"):
+        q += " AND status = ?"
+        params.append(filters["status"])
+    if filters.get("list_id") is not None:
+        q += " AND list_id = ?"
+        params.append(filters["list_id"])
+    if filters.get("tag"):
+        q += " AND tags LIKE ?"
+        params.append(f'%"{filters["tag"]}"%')
+    if filters.get("company_contains"):
+        q += " AND company LIKE ?"
+        params.append(f'%{filters["company_contains"]}%')
+    if filters.get("job_title_contains"):
+        q += " AND job_title LIKE ?"
+        params.append(f'%{filters["job_title_contains"]}%')
+    q += " ORDER BY created_at DESC"
+    rows = await db.execute_fetchall(q, params)
+    return [_prospect_row(r) for r in rows]
+
+
+async def create_smart_list(db: aiosqlite.Connection, data: dict) -> dict:
+    now = datetime.now(timezone.utc).isoformat()
+    filters = data["filters"]
+    cur = await db.execute(
+        "INSERT INTO smart_lists (name, filters, created_at) VALUES (?,?,?)",
+        (data["name"], jsonlib.dumps(filters), now),
+    )
+    await db.commit()
+    count = await _smart_list_count(db, filters)
+    return {
+        "id": cur.lastrowid,
+        "name": data["name"],
+        "filters": filters,
+        "matching_count": count,
+        "created_at": now,
+    }
+
+
+async def list_smart_lists(db: aiosqlite.Connection) -> list[dict]:
+    rows = await db.execute_fetchall("SELECT * FROM smart_lists ORDER BY created_at DESC")
+    result = []
+    for r in rows:
+        filters = jsonlib.loads(r["filters"])
+        count = await _smart_list_count(db, filters)
+        result.append({
+            "id": r["id"],
+            "name": r["name"],
+            "filters": filters,
+            "matching_count": count,
+            "created_at": r["created_at"],
+        })
+    return result
+
+
+async def get_smart_list(db: aiosqlite.Connection, smart_list_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM smart_lists WHERE id = ?", (smart_list_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    filters = jsonlib.loads(r["filters"])
+    count = await _smart_list_count(db, filters)
+    return {
+        "id": r["id"],
+        "name": r["name"],
+        "filters": filters,
+        "matching_count": count,
+        "created_at": r["created_at"],
+    }
+
+
+async def get_smart_list_prospects(db: aiosqlite.Connection, smart_list_id: int) -> list[dict] | None:
+    rows = await db.execute_fetchall("SELECT * FROM smart_lists WHERE id = ?", (smart_list_id,))
+    if not rows:
+        return None
+    filters = jsonlib.loads(rows[0]["filters"])
+    return await _smart_list_prospects(db, filters)
+
+
+async def delete_smart_list(db: aiosqlite.Connection, smart_list_id: int) -> bool:
+    cur = await db.execute("DELETE FROM smart_lists WHERE id = ?", (smart_list_id,))
+    await db.commit()
+    return cur.rowcount > 0
+
+
+# ── Enrollment Pause/Resume ──────────────────────────────────────────────
+
+async def pause_enrollment(db: aiosqlite.Connection, enrollment_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM enrollments WHERE id = ?", (enrollment_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    if r["status"] != "active":
+        return {"enrollment_id": enrollment_id, "status": r["status"],
+                "message": f"Cannot pause: enrollment is {r['status']}"}
+    await db.execute("UPDATE enrollments SET status = 'paused' WHERE id = ?", (enrollment_id,))
+    await db.commit()
+    return {"enrollment_id": enrollment_id, "status": "paused", "message": "Enrollment paused"}
+
+
+async def resume_enrollment(db: aiosqlite.Connection, enrollment_id: int) -> dict | None:
+    rows = await db.execute_fetchall("SELECT * FROM enrollments WHERE id = ?", (enrollment_id,))
+    if not rows:
+        return None
+    r = rows[0]
+    if r["status"] != "paused":
+        return {"enrollment_id": enrollment_id, "status": r["status"],
+                "message": f"Cannot resume: enrollment is {r['status']}"}
+    now = datetime.now(timezone.utc).isoformat()
+    await db.execute(
+        "UPDATE enrollments SET status = 'active', last_advanced_at = ? WHERE id = ?",
+        (now, enrollment_id),
+    )
+    await db.commit()
+    return {"enrollment_id": enrollment_id, "status": "active", "message": "Enrollment resumed"}
+
+
+async def pause_all_enrollments(db: aiosqlite.Connection, seq_id: int) -> dict | None:
+    seq = await _get_sequence(db, seq_id)
+    if not seq:
+        return None
+    cur = await db.execute(
+        "UPDATE enrollments SET status = 'paused' WHERE sequence_id = ? AND status = 'active'",
+        (seq_id,),
+    )
+    await db.commit()
+    return {"affected": cur.rowcount, "skipped": 0}
+
+
+async def resume_all_enrollments(db: aiosqlite.Connection, seq_id: int) -> dict | None:
+    seq = await _get_sequence(db, seq_id)
+    if not seq:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await db.execute(
+        "UPDATE enrollments SET status = 'active', last_advanced_at = ? WHERE sequence_id = ? AND status = 'paused'",
+        (now, seq_id),
+    )
+    await db.commit()
+    return {"affected": cur.rowcount, "skipped": 0}
+
+
+# ── Prospect Merge ───────────────────────────────────────────────────────
+
+async def find_duplicates(db: aiosqlite.Connection) -> list[dict]:
+    """Find potential duplicate prospects by email."""
+    rows = await db.execute_fetchall("""
+        SELECT email, COUNT(*) as cnt
+        FROM prospects
+        GROUP BY LOWER(email)
+        HAVING cnt > 1
+        ORDER BY cnt DESC
+        LIMIT 50
+    """)
+    groups = []
+    for r in rows:
+        prospects = await db.execute_fetchall(
+            "SELECT id, first_name, last_name, email FROM prospects WHERE LOWER(email) = LOWER(?)",
+            (r["email"],),
+        )
+        groups.append({
+            "key": r["email"].lower(),
+            "prospect_ids": [p["id"] for p in prospects],
+            "names": [f"{p['first_name']} {p['last_name']}" for p in prospects],
+            "emails": [p["email"] for p in prospects],
+        })
+
+    # Also check same first_name + last_name + company
+    name_dupes = await db.execute_fetchall("""
+        SELECT LOWER(first_name) || '|' || LOWER(last_name) || '|' || LOWER(company) as key,
+               COUNT(*) as cnt
+        FROM prospects
+        GROUP BY LOWER(first_name), LOWER(last_name), LOWER(company)
+        HAVING cnt > 1
+        ORDER BY cnt DESC
+        LIMIT 50
+    """)
+    seen_keys = {g["key"] for g in groups}
+    for r in name_dupes:
+        parts = r["key"].split("|")
+        prospects = await db.execute_fetchall(
+            "SELECT id, first_name, last_name, email FROM prospects WHERE LOWER(first_name) = ? AND LOWER(last_name) = ? AND LOWER(company) = ?",
+            (parts[0], parts[1], parts[2]),
+        )
+        key = f"name:{r['key']}"
+        if key not in seen_keys:
+            groups.append({
+                "key": key,
+                "prospect_ids": [p["id"] for p in prospects],
+                "names": [f"{p['first_name']} {p['last_name']}" for p in prospects],
+                "emails": [p["email"] for p in prospects],
+            })
+    return groups
+
+
+async def merge_prospects(db: aiosqlite.Connection, keep_id: int, merge_id: int) -> dict | str | None:
+    """Merge merge_id prospect into keep_id. Transfers all data, deletes merge_id."""
+    if keep_id == merge_id:
+        return "same_prospect"
+    keep = await get_prospect(db, keep_id)
+    if not keep:
+        return None
+    merge = await get_prospect(db, merge_id)
+    if not merge:
+        return "merge_not_found"
+
+    # Transfer draft_log
+    cur_drafts = await db.execute(
+        "UPDATE draft_log SET prospect_id = ? WHERE prospect_id = ?",
+        (keep_id, merge_id),
+    )
+    drafts_transferred = cur_drafts.rowcount
+
+    # Transfer campaign_events
+    cur_events = await db.execute(
+        "UPDATE campaign_events SET prospect_id = ? WHERE prospect_id = ?",
+        (keep_id, merge_id),
+    )
+    events_transferred = cur_events.rowcount
+
+    # Transfer enrollments (skip if would violate uniqueness)
+    existing_seqs = await db.execute_fetchall(
+        "SELECT sequence_id FROM enrollments WHERE prospect_id = ?", (keep_id,))
+    existing_seq_ids = {r["sequence_id"] for r in existing_seqs}
+
+    merge_enrollments = await db.execute_fetchall(
+        "SELECT * FROM enrollments WHERE prospect_id = ?", (merge_id,))
+    enrollments_transferred = 0
+    for e in merge_enrollments:
+        if e["sequence_id"] not in existing_seq_ids:
+            await db.execute(
+                "UPDATE enrollments SET prospect_id = ? WHERE id = ?",
+                (keep_id, e["id"]),
+            )
+            enrollments_transferred += 1
+    # Delete remaining duplicate enrollments
+    await db.execute("DELETE FROM enrollments WHERE prospect_id = ?", (merge_id,))
+
+    # Merge tags
+    keep_tags = set(keep.get("tags", []))
+    merge_tags = set(merge.get("tags", []))
+    combined = list(keep_tags | merge_tags)
+    await db.execute(
+        "UPDATE prospects SET tags = ? WHERE id = ?",
+        (jsonlib.dumps(combined), keep_id),
+    )
+
+    # Merge notes
+    if merge.get("notes") and not keep.get("notes"):
+        await db.execute("UPDATE prospects SET notes = ? WHERE id = ?", (merge["notes"], keep_id))
+    elif merge.get("notes") and keep.get("notes"):
+        combined_notes = f"{keep['notes']}\n[merged] {merge['notes']}"
+        await db.execute("UPDATE prospects SET notes = ? WHERE id = ?", (combined_notes, keep_id))
+
+    # Fill in missing fields from merge prospect
+    for field in ("job_title", "website", "linkedin_url"):
+        if not keep.get(field) and merge.get(field):
+            await db.execute(f"UPDATE prospects SET {field} = ? WHERE id = ?", (merge[field], keep_id))
+
+    # Delete the merged prospect
+    await db.execute("DELETE FROM prospects WHERE id = ?", (merge_id,))
+    await db.commit()
+
+    return {
+        "kept_prospect_id": keep_id,
+        "merged_prospect_id": merge_id,
+        "transferred_drafts": drafts_transferred,
+        "transferred_events": events_transferred,
+        "transferred_enrollments": enrollments_transferred,
     }

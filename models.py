@@ -106,6 +106,7 @@ class UsageStats(BaseModel):
     total_templates: int
     total_sequences: int
     total_dnc_entries: int
+    total_smart_lists: int
     by_status: dict[str, int]
     most_used_tone: Optional[str]
 
@@ -268,3 +269,56 @@ class DncResponse(BaseModel):
     domain: Optional[str]
     reason: Optional[str]
     created_at: str
+
+
+# ── Smart Lists ─────────────────────────────────────────────────────────
+
+class SmartListCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    filters: dict = Field(
+        ...,
+        description="Filter criteria: status, list_id, tag, company_contains, job_title_contains",
+    )
+
+
+class SmartListResponse(BaseModel):
+    id: int
+    name: str
+    filters: dict
+    matching_count: int
+    created_at: str
+
+
+# ── Enrollment Pause/Resume ─────────────────────────────────────────────
+
+class EnrollmentActionResult(BaseModel):
+    enrollment_id: int
+    status: str
+    message: str
+
+
+class BulkEnrollmentResult(BaseModel):
+    affected: int
+    skipped: int
+
+
+# ── Prospect Merge ──────────────────────────────────────────────────────
+
+class DuplicateGroup(BaseModel):
+    key: str
+    prospect_ids: list[int]
+    names: list[str]
+    emails: list[str]
+
+
+class MergeRequest(BaseModel):
+    keep_id: int = Field(..., description="Prospect ID to keep")
+    merge_id: int = Field(..., description="Prospect ID to merge into keep_id and delete")
+
+
+class MergeResult(BaseModel):
+    kept_prospect_id: int
+    merged_prospect_id: int
+    transferred_drafts: int
+    transferred_events: int
+    transferred_enrollments: int
