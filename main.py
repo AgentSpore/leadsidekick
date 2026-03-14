@@ -3,7 +3,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -28,6 +28,14 @@ from models import (
     ABTestCreate, ABTestResponse, ABTestAssignment, ABTestComplete, ABTestAssignmentResponse,
     SegmentCreate, SegmentUpdate, SegmentResponse, SegmentProspectEntry,
     AutomationRuleCreate, AutomationRuleUpdate, AutomationRuleResponse, AutomationEvaluateRequest,
+    # v1.1.0: Email Warmup Tracking
+    EmailAccountCreate, EmailAccountUpdate, EmailAccountResponse,
+    WarmupLogCreate, WarmupLogResponse, WarmupProgress,
+    # v1.1.0: Prospect Enrichment Log
+    EnrichmentProviderCreate, EnrichmentProviderUpdate, EnrichmentProviderResponse,
+    EnrichmentLogResponse, BulkEnrichRequest, BulkEnrichResult, EnrichmentStats,
+    # v1.1.0: Reply Sentiment Analysis
+    ReplyCreate, ReplyAnalysisResponse, ReplyAnalytics, SequenceSentiment,
 )
 from engine import (
     init_db, create_prospect, list_prospects, get_prospect, update_prospect_status,
@@ -61,6 +69,16 @@ from engine import (
     create_automation_rule, list_automation_rules, get_automation_rule,
     update_automation_rule, delete_automation_rule,
     evaluate_automation_for_prospect,
+    # v1.1.0: Email Warmup Tracking
+    create_email_account, list_email_accounts, get_email_account,
+    update_email_account, delete_email_account,
+    record_warmup_log, list_warmup_log, get_warmup_progress,
+    # v1.1.0: Prospect Enrichment Log
+    create_enrichment_provider, list_enrichment_providers,
+    update_enrichment_provider, delete_enrichment_provider,
+    enrich_prospect, list_enrichment_log, bulk_enrich_prospects, get_enrichment_stats,
+    # v1.1.0: Reply Sentiment Analysis
+    analyze_reply, list_replies, get_reply, get_reply_analytics, get_sequence_sentiment,
 )
 
 DB_PATH = os.getenv("DB_PATH", "leadsidekick.db")
@@ -74,7 +92,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="LeadSidekick",
+    title="LeadSidekick v1.1.0",
     description=(
         "Lead prospecting + personalised cold outreach drafter. "
         "Prospect management, sequences with pause/resume, campaign analytics, "
@@ -82,9 +100,10 @@ app = FastAPI(
         "sequence cloning, do-not-contact list, smart lists (saved filters), "
         "prospect deduplication with merge, threaded prospect notes with pinning, "
         "reusable email snippets, outreach calendar view, email A/B split-testing, "
-        "dynamic prospect segments, and trigger-based outreach automation rules."
+        "dynamic prospect segments, trigger-based outreach automation rules, "
+        "email warmup tracking, prospect enrichment log, and reply sentiment analysis."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -92,7 +111,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "1.1.0"}
 
 
 # ── Smart Lists ─────────────────────────────────────────────────────────
@@ -771,3 +790,180 @@ async def evaluate_automation_endpoint(prospect_id: int, body: AutomationEvaluat
         app.state.db, prospect_id, body.trigger_type, body.trigger_data,
     )
     return {"prospect_id": prospect_id, "rules_fired": fired, "count": len(fired)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1.0 Feature 1: Email Warmup Tracking
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/email-accounts", response_model=EmailAccountResponse, status_code=201)
+async def create_email_account_endpoint(body: EmailAccountCreate):
+    """Register a new email account for warmup tracking."""
+    return await create_email_account(app.state.db, body.model_dump())
+
+
+@app.get("/email-accounts", response_model=list[EmailAccountResponse])
+async def list_email_accounts_endpoint():
+    """List all registered email accounts."""
+    return await list_email_accounts(app.state.db)
+
+
+@app.get("/email-accounts/{account_id}", response_model=EmailAccountResponse)
+async def get_email_account_endpoint(account_id: int):
+    """Get details for a specific email account."""
+    result = await get_email_account(app.state.db, account_id)
+    if not result:
+        raise HTTPException(404, "Email account not found")
+    return result
+
+
+@app.patch("/email-accounts/{account_id}", response_model=EmailAccountResponse)
+async def update_email_account_endpoint(account_id: int, body: EmailAccountUpdate):
+    """Update email account settings (daily_limit, status)."""
+    result = await update_email_account(app.state.db, account_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Email account not found")
+    return result
+
+
+@app.delete("/email-accounts/{account_id}", status_code=204)
+async def delete_email_account_endpoint(account_id: int):
+    """Remove an email account."""
+    if not await delete_email_account(app.state.db, account_id):
+        raise HTTPException(404, "Email account not found")
+
+
+@app.post("/email-accounts/{account_id}/warmup-log", response_model=WarmupLogResponse, status_code=201)
+async def create_warmup_log_endpoint(account_id: int, body: WarmupLogCreate):
+    """Record a warmup log entry for an email account."""
+    result = await record_warmup_log(app.state.db, account_id, body.model_dump())
+    if not result:
+        raise HTTPException(404, "Email account not found")
+    return result
+
+
+@app.get("/email-accounts/{account_id}/warmup-log", response_model=list[WarmupLogResponse])
+async def list_warmup_log_endpoint(
+    account_id: int,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List warmup log entries for an email account."""
+    return await list_warmup_log(app.state.db, account_id, limit, offset)
+
+
+@app.get("/email-accounts/{account_id}/warmup-progress", response_model=WarmupProgress)
+async def get_warmup_progress_endpoint(account_id: int):
+    """Get warmup progress and health assessment for an email account."""
+    result = await get_warmup_progress(app.state.db, account_id)
+    if not result:
+        raise HTTPException(404, "Email account not found")
+    return result
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1.0 Feature 2: Prospect Enrichment Log
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/enrichment-providers", response_model=EnrichmentProviderResponse, status_code=201)
+async def create_enrichment_provider_endpoint(body: EnrichmentProviderCreate):
+    """Register a new enrichment data provider."""
+    return await create_enrichment_provider(app.state.db, body.model_dump())
+
+
+@app.get("/enrichment-providers", response_model=list[EnrichmentProviderResponse])
+async def list_enrichment_providers_endpoint():
+    """List all enrichment providers."""
+    return await list_enrichment_providers(app.state.db)
+
+
+@app.patch("/enrichment-providers/{provider_id}", response_model=EnrichmentProviderResponse)
+async def update_enrichment_provider_endpoint(provider_id: int, body: EnrichmentProviderUpdate):
+    """Update enrichment provider settings (priority, enabled state)."""
+    result = await update_enrichment_provider(app.state.db, provider_id, body.model_dump(exclude_unset=True))
+    if not result:
+        raise HTTPException(404, "Enrichment provider not found")
+    return result
+
+
+@app.delete("/enrichment-providers/{provider_id}", status_code=204)
+async def delete_enrichment_provider_endpoint(provider_id: int):
+    """Remove an enrichment provider."""
+    if not await delete_enrichment_provider(app.state.db, provider_id):
+        raise HTTPException(404, "Enrichment provider not found")
+
+
+@app.post("/prospects/{prospect_id}/enrich", response_model=EnrichmentLogResponse, status_code=201)
+async def enrich_prospect_endpoint(
+    prospect_id: int,
+    source: str = Query("auto", description="Enrichment source (default: auto)"),
+):
+    """Enrich a prospect with additional data from configured providers."""
+    result = await enrich_prospect(app.state.db, prospect_id, source)
+    if not result:
+        raise HTTPException(404, "Prospect not found")
+    return result
+
+
+@app.get("/prospects/{prospect_id}/enrichment-log", response_model=list[EnrichmentLogResponse])
+async def list_enrichment_log_endpoint(prospect_id: int):
+    """List enrichment log entries for a prospect."""
+    return await list_enrichment_log(app.state.db, prospect_id)
+
+
+@app.post("/prospects/bulk-enrich", response_model=BulkEnrichResult, status_code=201)
+async def bulk_enrich_endpoint(body: BulkEnrichRequest):
+    """Enrich multiple prospects in one request."""
+    return await bulk_enrich_prospects(app.state.db, body.prospect_ids)
+
+
+@app.get("/enrichment/stats", response_model=EnrichmentStats)
+async def enrichment_stats_endpoint():
+    """Get enrichment statistics across all providers."""
+    return await get_enrichment_stats(app.state.db)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1.0 Feature 3: Reply Sentiment Analysis
+# ══════════════════════════════════════════════════════════════════════════
+
+@app.post("/replies", response_model=ReplyAnalysisResponse, status_code=201)
+async def create_reply_endpoint(body: ReplyCreate):
+    """Analyze a reply for sentiment, key phrases, and auto-actions."""
+    return await analyze_reply(app.state.db, body.model_dump())
+
+
+@app.get("/replies/analytics", response_model=ReplyAnalytics)
+async def reply_analytics_endpoint():
+    """Get reply sentiment analytics with trends and auto-action summary."""
+    return await get_reply_analytics(app.state.db)
+
+
+@app.get("/replies", response_model=list[ReplyAnalysisResponse])
+async def list_replies_endpoint(
+    sentiment: str | None = Query(None, description="Filter by sentiment"),
+    prospect_id: int | None = Query(None, description="Filter by prospect"),
+    sequence_id: int | None = Query(None, description="Filter by sequence"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """List analyzed replies with optional filters."""
+    return await list_replies(app.state.db, sentiment, prospect_id, sequence_id, limit, offset)
+
+
+@app.get("/replies/{reply_id}", response_model=ReplyAnalysisResponse)
+async def get_reply_endpoint(reply_id: int):
+    """Get a specific reply analysis."""
+    result = await get_reply(app.state.db, reply_id)
+    if not result:
+        raise HTTPException(404, "Reply not found")
+    return result
+
+
+@app.get("/sequences/{sequence_id}/sentiment", response_model=SequenceSentiment)
+async def sequence_sentiment_endpoint(sequence_id: int):
+    """Get sentiment analysis summary for a specific sequence."""
+    result = await get_sequence_sentiment(app.state.db, sequence_id)
+    if not result:
+        raise HTTPException(404, "Sequence not found")
+    return result
