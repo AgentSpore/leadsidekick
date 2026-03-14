@@ -110,6 +110,9 @@ class UsageStats(BaseModel):
     total_segments: int
     total_ab_tests: int
     total_automation_rules: int
+    total_email_accounts: int
+    total_enrichment_lookups: int
+    total_replies_analyzed: int
     by_status: dict[str, int]
     most_used_tone: Optional[str]
 
@@ -522,3 +525,169 @@ class AutomationRuleResponse(BaseModel):
 class AutomationEvaluateRequest(BaseModel):
     trigger_type: str = Field(..., description="status_change | event_received | score_threshold | enrollment_completed")
     trigger_data: dict = Field(default_factory=dict, description="Trigger-specific data for evaluation")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1.0 Feature 1: Email Warmup Tracking
+# ══════════════════════════════════════════════════════════════════════════
+
+class EmailAccountCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=200)
+    provider: str = Field(min_length=1, max_length=80, description="e.g. gmail, outlook, sendgrid")
+    daily_limit: int = Field(ge=1, le=10000, description="Max emails per day")
+    warmup_target_limit: int = Field(ge=1, le=10000, description="Target daily limit after warmup")
+
+
+class EmailAccountUpdate(BaseModel):
+    daily_limit: Optional[int] = Field(None, ge=1, le=10000)
+    status: Optional[str] = Field(None, description="warming | active | paused")
+
+
+class EmailAccountResponse(BaseModel):
+    id: int
+    email: str
+    provider: str
+    daily_limit: int
+    current_daily_sent: int
+    warmup_start_date: str
+    warmup_day: int
+    warmup_target_limit: int
+    status: str
+    reputation_score: float
+    bounce_rate: float
+    spam_rate: float
+    created_at: str
+    updated_at: str
+
+
+class WarmupLogCreate(BaseModel):
+    sent_count: int = Field(ge=0)
+    delivered_count: int = Field(ge=0)
+    bounced_count: int = Field(ge=0, default=0)
+    spam_count: int = Field(ge=0, default=0)
+
+
+class WarmupLogResponse(BaseModel):
+    id: int
+    account_id: int
+    date: str
+    sent_count: int
+    delivered_count: int
+    bounced_count: int
+    spam_count: int
+    reputation_delta: float
+    created_at: str
+
+
+class WarmupProgress(BaseModel):
+    account_id: int
+    email: str
+    status: str
+    warmup_day: int
+    current_daily_limit: int
+    warmup_target_limit: int
+    reputation_score: float
+    bounce_rate: float
+    spam_rate: float
+    projected_completion_days: int
+    health: str
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1.0 Feature 2: Prospect Enrichment Log
+# ══════════════════════════════════════════════════════════════════════════
+
+class EnrichmentProviderCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    api_type: str = Field(min_length=1, max_length=80, description="e.g. rest, graphql, scraper")
+    priority: int = Field(ge=1, le=100, default=10)
+    is_enabled: bool = Field(True)
+
+
+class EnrichmentProviderUpdate(BaseModel):
+    priority: Optional[int] = Field(None, ge=1, le=100)
+    is_enabled: Optional[bool] = None
+
+
+class EnrichmentProviderResponse(BaseModel):
+    id: int
+    name: str
+    api_type: str
+    priority: int
+    is_enabled: bool
+    total_lookups: int
+    successful_lookups: int
+    created_at: str
+
+
+class EnrichmentLogResponse(BaseModel):
+    id: int
+    prospect_id: int
+    source: str
+    fields_before: dict
+    fields_after: dict
+    fields_updated: list[str]
+    status: str
+    error_message: Optional[str]
+    created_at: str
+
+
+class BulkEnrichRequest(BaseModel):
+    prospect_ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class BulkEnrichResult(BaseModel):
+    total: int
+    enriched: int
+    failed: int
+    skipped: int
+
+
+class EnrichmentStats(BaseModel):
+    total_lookups: int
+    successful_lookups: int
+    success_rate: float
+    top_fields_enriched: dict[str, int]
+    by_provider: list[dict]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v1.1.0 Feature 3: Reply Sentiment Analysis
+# ══════════════════════════════════════════════════════════════════════════
+
+class ReplyCreate(BaseModel):
+    prospect_id: int
+    sequence_id: Optional[int] = None
+    draft_id: Optional[int] = None
+    reply_text: str = Field(min_length=1)
+
+
+class ReplyAnalysisResponse(BaseModel):
+    id: int
+    prospect_id: int
+    sequence_id: Optional[int]
+    draft_id: Optional[int]
+    reply_text: str
+    sentiment: str
+    confidence: float
+    key_phrases: list[str]
+    auto_action_taken: Optional[str]
+    created_at: str
+
+
+class ReplyAnalytics(BaseModel):
+    total_replies: int
+    by_sentiment: dict[str, int]
+    avg_confidence: float
+    sentiment_trend: list[dict]
+    auto_actions_summary: dict[str, int]
+
+
+class SequenceSentiment(BaseModel):
+    sequence_id: int
+    sequence_name: str
+    total_replies: int
+    reply_rate: float
+    sentiment_distribution: dict[str, int]
+    top_positive_phrases: list[str]
+    top_negative_phrases: list[str]
