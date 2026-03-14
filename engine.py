@@ -179,6 +179,71 @@ CREATE INDEX IF NOT EXISTS idx_ab_assignments_test ON ab_test_assignments(test_i
 CREATE INDEX IF NOT EXISTS idx_segments_auto ON segments(auto_assign);
 CREATE INDEX IF NOT EXISTS idx_automation_trigger ON automation_rules(trigger_type, is_enabled);
 
+CREATE TABLE IF NOT EXISTS email_accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'unknown',
+    daily_limit INTEGER NOT NULL DEFAULT 20,
+    current_daily_sent INTEGER NOT NULL DEFAULT 0,
+    warmup_start_date TEXT,
+    warmup_day INTEGER NOT NULL DEFAULT 0,
+    warmup_target_limit INTEGER NOT NULL DEFAULT 200,
+    status TEXT NOT NULL DEFAULT 'warming',
+    reputation_score REAL NOT NULL DEFAULT 100.0,
+    bounce_rate REAL NOT NULL DEFAULT 0.0,
+    spam_rate REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS warmup_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id INTEGER NOT NULL REFERENCES email_accounts(id),
+    date TEXT NOT NULL,
+    sent_count INTEGER NOT NULL DEFAULT 0,
+    delivered_count INTEGER NOT NULL DEFAULT 0,
+    bounced_count INTEGER NOT NULL DEFAULT 0,
+    spam_count INTEGER NOT NULL DEFAULT 0,
+    reputation_delta REAL NOT NULL DEFAULT 0.0,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_warmup_log_account ON warmup_log(account_id);
+CREATE TABLE IF NOT EXISTS enrichment_providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    api_type TEXT NOT NULL DEFAULT 'rest',
+    priority INTEGER NOT NULL DEFAULT 0,
+    is_enabled INTEGER NOT NULL DEFAULT 1,
+    total_lookups INTEGER NOT NULL DEFAULT 0,
+    successful_lookups INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS enrichment_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prospect_id INTEGER NOT NULL REFERENCES prospects(id),
+    source TEXT NOT NULL DEFAULT 'auto',
+    fields_before TEXT NOT NULL DEFAULT '{}',
+    fields_after TEXT NOT NULL DEFAULT '{}',
+    fields_updated TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'success',
+    error_message TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_enrichment_log_prospect ON enrichment_log(prospect_id);
+CREATE TABLE IF NOT EXISTS reply_analysis (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prospect_id INTEGER NOT NULL REFERENCES prospects(id),
+    sequence_id INTEGER,
+    draft_id INTEGER,
+    reply_text TEXT NOT NULL,
+    sentiment TEXT NOT NULL DEFAULT 'neutral',
+    confidence REAL NOT NULL DEFAULT 0.5,
+    key_phrases TEXT NOT NULL DEFAULT '[]',
+    auto_action_taken TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reply_analysis_prospect ON reply_analysis(prospect_id);
+CREATE INDEX IF NOT EXISTS idx_reply_analysis_sentiment ON reply_analysis(sentiment);
+
 INSERT OR IGNORE INTO usage_stats (id) VALUES (1);
 """
 
@@ -563,7 +628,7 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
     by_status = {r["status"]: r["cnt"] for r in status_rows}
     tone_rows = await db.execute_fetchall("SELECT tone, COUNT(*) as cnt FROM draft_log GROUP BY tone ORDER BY cnt DESC LIMIT 1")
     most_used_tone = tone_rows[0]["tone"] if tone_rows else None
-    return {
+    stats = {
         "total_prospects": total_p, "total_drafts_generated": total_drafts,
         "total_lists": total_l, "total_templates": total_t,
         "total_sequences": total_s, "total_dnc_entries": total_dnc,
@@ -573,6 +638,13 @@ async def get_stats(db: aiosqlite.Connection) -> dict:
         "total_automation_rules": total_auto,
         "by_status": by_status, "most_used_tone": most_used_tone,
     }
+    r = await db.execute("SELECT COUNT(*) FROM email_accounts")
+    stats["total_email_accounts"] = (await r.fetchone())[0]
+    r = await db.execute("SELECT COUNT(*) FROM enrichment_log")
+    stats["total_enrichment_lookups"] = (await r.fetchone())[0]
+    r = await db.execute("SELECT COUNT(*) FROM reply_analysis")
+    stats["total_replies_analyzed"] = (await r.fetchone())[0]
+    return stats
 
 
 async def list_drafts(db: aiosqlite.Connection, prospect_id: int | None = None,
@@ -601,6 +673,52 @@ def _draft_log_row(r: aiosqlite.Row) -> dict:
         "subject": r["subject"], "body": body,
         "word_count": len(body.split()) if body else 0,
         "created_at": r["created_at"],
+    }
+
+
+def _email_account_row(row):
+    return {
+        "id": row["id"], "email": row["email"], "provider": row["provider"],
+        "daily_limit": row["daily_limit"], "current_daily_sent": row["current_daily_sent"],
+        "warmup_start_date": row["warmup_start_date"], "warmup_day": row["warmup_day"],
+        "warmup_target_limit": row["warmup_target_limit"], "status": row["status"],
+        "reputation_score": row["reputation_score"], "bounce_rate": row["bounce_rate"],
+        "spam_rate": row["spam_rate"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+
+def _warmup_log_row(row):
+    return {
+        "id": row["id"], "account_id": row["account_id"], "date": row["date"],
+        "sent_count": row["sent_count"], "delivered_count": row["delivered_count"],
+        "bounced_count": row["bounced_count"], "spam_count": row["spam_count"],
+        "reputation_delta": row["reputation_delta"], "created_at": row["created_at"],
+    }
+
+def _enrichment_provider_row(row):
+    return {
+        "id": row["id"], "name": row["name"], "api_type": row["api_type"],
+        "priority": row["priority"], "is_enabled": bool(row["is_enabled"]),
+        "total_lookups": row["total_lookups"], "successful_lookups": row["successful_lookups"],
+        "created_at": row["created_at"],
+    }
+
+def _enrichment_log_row(row):
+    return {
+        "id": row["id"], "prospect_id": row["prospect_id"], "source": row["source"],
+        "fields_before": jsonlib.loads(row["fields_before"]) if isinstance(row["fields_before"], str) else row["fields_before"],
+        "fields_after": jsonlib.loads(row["fields_after"]) if isinstance(row["fields_after"], str) else row["fields_after"],
+        "fields_updated": jsonlib.loads(row["fields_updated"]) if isinstance(row["fields_updated"], str) else row["fields_updated"],
+        "status": row["status"], "error_message": row["error_message"], "created_at": row["created_at"],
+    }
+
+def _reply_analysis_row(row):
+    return {
+        "id": row["id"], "prospect_id": row["prospect_id"],
+        "sequence_id": row["sequence_id"], "draft_id": row["draft_id"],
+        "reply_text": row["reply_text"], "sentiment": row["sentiment"],
+        "confidence": row["confidence"],
+        "key_phrases": jsonlib.loads(row["key_phrases"]) if isinstance(row["key_phrases"], str) else row["key_phrases"],
+        "auto_action_taken": row["auto_action_taken"], "created_at": row["created_at"],
     }
 
 
@@ -2312,3 +2430,389 @@ async def evaluate_automation_for_prospect(db: aiosqlite.Connection, prospect_id
             fired_rule_ids.append(r["id"])
 
     return fired_rule_ids
+
+# --- v1.1.0 new functions below ---
+
+
+# ── Email Warmup Tracking ────────────────────────────────────────────
+
+
+async def create_email_account(db, email: str, provider: str = "unknown", daily_limit: int = 20, warmup_target_limit: int = 200):
+    now = _now()
+    try:
+        r = await db.execute(
+            "INSERT INTO email_accounts (email, provider, daily_limit, warmup_target_limit, warmup_start_date, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (email, provider, daily_limit, warmup_target_limit, now, "warming", now, now),
+        )
+        await db.commit()
+        return await get_email_account(db, r.lastrowid)
+    except Exception:
+        raise ValueError(f"Email account '{email}' already exists")
+
+
+async def list_email_accounts(db):
+    r = await db.execute("SELECT * FROM email_accounts ORDER BY created_at DESC")
+    return [_email_account_row(row) for row in await r.fetchall()]
+
+
+async def get_email_account(db, account_id: int):
+    r = await db.execute("SELECT * FROM email_accounts WHERE id=?", (account_id,))
+    row = await r.fetchone()
+    return _email_account_row(row) if row else None
+
+
+async def update_email_account(db, account_id: int, **kwargs):
+    acct = await get_email_account(db, account_id)
+    if not acct:
+        return None
+    allowed = {"daily_limit", "status", "warmup_target_limit", "provider"}
+    sets, vals = [], []
+    for k, v in kwargs.items():
+        if k in allowed and v is not None:
+            sets.append(f"{k}=?")
+            vals.append(v)
+    if not sets:
+        return acct
+    sets.append("updated_at=?")
+    vals.append(_now())
+    vals.append(account_id)
+    await db.execute(f"UPDATE email_accounts SET {','.join(sets)} WHERE id=?", vals)
+    await db.commit()
+    return await get_email_account(db, account_id)
+
+
+async def delete_email_account(db, account_id: int):
+    r = await db.execute("DELETE FROM email_accounts WHERE id=?", (account_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def record_warmup_log(db, account_id: int, date: str, sent_count: int, delivered_count: int, bounced_count: int, spam_count: int):
+    acct = await get_email_account(db, account_id)
+    if not acct:
+        return None
+    rep_delta = (delivered_count / max(1, sent_count) * 100) - acct["reputation_score"]
+    now = _now()
+    r = await db.execute(
+        "INSERT INTO warmup_log (account_id, date, sent_count, delivered_count, bounced_count, spam_count, reputation_delta, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (account_id, date, sent_count, delivered_count, bounced_count, spam_count, round(rep_delta, 2), now),
+    )
+    await db.commit()
+    # Recalculate aggregates
+    agg = await db.execute(
+        "SELECT COUNT(*) as cnt, SUM(sent_count) as total_sent, SUM(delivered_count) as total_del, SUM(bounced_count) as total_bounce, SUM(spam_count) as total_spam FROM warmup_log WHERE account_id=?",
+        (account_id,),
+    )
+    row = await agg.fetchone()
+    total_sent = row["total_sent"] or 1
+    new_rep = round(row["total_del"] / max(1, total_sent) * 100, 2)
+    new_bounce = round(row["total_bounce"] / max(1, total_sent) * 100, 2)
+    new_spam = round(row["total_spam"] / max(1, total_sent) * 100, 2)
+    warmup_day = row["cnt"]
+    await db.execute(
+        "UPDATE email_accounts SET reputation_score=?, bounce_rate=?, spam_rate=?, warmup_day=?, updated_at=? WHERE id=?",
+        (new_rep, new_bounce, new_spam, warmup_day, _now(), account_id),
+    )
+    await db.commit()
+    log_r = await db.execute("SELECT * FROM warmup_log WHERE id=?", (r.lastrowid,))
+    log_row = await log_r.fetchone()
+    return _warmup_log_row(log_row)
+
+
+async def list_warmup_log(db, account_id: int, limit: int = 50, offset: int = 0):
+    r = await db.execute(
+        "SELECT * FROM warmup_log WHERE account_id=? ORDER BY date DESC LIMIT ? OFFSET ?",
+        (account_id, limit, offset),
+    )
+    return [_warmup_log_row(row) for row in await r.fetchall()]
+
+
+async def get_warmup_progress(db, account_id: int):
+    acct = await get_email_account(db, account_id)
+    if not acct:
+        return None
+    pct = round(acct["daily_limit"] / max(1, acct["warmup_target_limit"]) * 100, 1)
+    remaining = 0
+    if acct["daily_limit"] < acct["warmup_target_limit"] and acct["warmup_day"] > 0:
+        daily_increase = acct["daily_limit"] / max(1, acct["warmup_day"])
+        remaining = int((acct["warmup_target_limit"] - acct["daily_limit"]) / max(1, daily_increase))
+    return {
+        "account_id": account_id,
+        "email": acct["email"],
+        "warmup_day": acct["warmup_day"],
+        "daily_limit": acct["daily_limit"],
+        "warmup_target_limit": acct["warmup_target_limit"],
+        "pct_to_target": pct,
+        "estimated_days_remaining": remaining,
+        "reputation_score": acct["reputation_score"],
+        "bounce_rate": acct["bounce_rate"],
+        "spam_rate": acct["spam_rate"],
+        "status": acct["status"],
+    }
+
+
+# ── Enrichment Log ───────────────────────────────────────────────────
+
+
+async def create_enrichment_provider(db, name: str, api_type: str = "rest", priority: int = 0):
+    now = _now()
+    try:
+        r = await db.execute(
+            "INSERT INTO enrichment_providers (name, api_type, priority, created_at) VALUES (?,?,?,?)",
+            (name, api_type, priority, now),
+        )
+        await db.commit()
+        row = await (await db.execute("SELECT * FROM enrichment_providers WHERE id=?", (r.lastrowid,))).fetchone()
+        return _enrichment_provider_row(row)
+    except Exception:
+        raise ValueError(f"Provider '{name}' already exists")
+
+
+async def list_enrichment_providers(db):
+    r = await db.execute("SELECT * FROM enrichment_providers ORDER BY priority ASC, name ASC")
+    return [_enrichment_provider_row(row) for row in await r.fetchall()]
+
+
+async def update_enrichment_provider(db, provider_id: int, **kwargs):
+    r = await db.execute("SELECT * FROM enrichment_providers WHERE id=?", (provider_id,))
+    row = await r.fetchone()
+    if not row:
+        return None
+    allowed = {"priority", "is_enabled", "name", "api_type"}
+    sets, vals = [], []
+    for k, v in kwargs.items():
+        if k in allowed and v is not None:
+            sets.append(f"{k}=?")
+            vals.append(v if k != "is_enabled" else int(v))
+    if not sets:
+        return _enrichment_provider_row(row)
+    vals.append(provider_id)
+    await db.execute(f"UPDATE enrichment_providers SET {','.join(sets)} WHERE id=?", vals)
+    await db.commit()
+    r2 = await db.execute("SELECT * FROM enrichment_providers WHERE id=?", (provider_id,))
+    return _enrichment_provider_row(await r2.fetchone())
+
+
+async def delete_enrichment_provider(db, provider_id: int):
+    r = await db.execute("DELETE FROM enrichment_providers WHERE id=?", (provider_id,))
+    await db.commit()
+    return r.rowcount > 0
+
+
+async def enrich_prospect(db, prospect_id: int, source: str = "auto"):
+    import json as jsonlib2
+    prospect = await get_prospect(db, prospect_id)
+    if not prospect:
+        return None
+    fields_before = {
+        "company": prospect.get("company"),
+        "job_title": prospect.get("job_title"),
+        "linkedin_url": prospect.get("linkedin_url"),
+        "website": prospect.get("website"),
+    }
+    fields_updated = []
+    email = prospect.get("email", "")
+    domain = email.split("@")[1] if "@" in email else ""
+    if domain and not prospect.get("company"):
+        company = domain.split(".")[0].replace("-", " ").replace("_", " ").title()
+        await db.execute("UPDATE prospects SET company=? WHERE id=?", (company, prospect_id))
+        fields_updated.append("company")
+    if domain and not prospect.get("website"):
+        website = f"https://www.{domain}"
+        await db.execute("UPDATE prospects SET website=? WHERE id=?", (website, prospect_id))
+        fields_updated.append("website")
+    if not prospect.get("linkedin_url") and prospect.get("first_name") and prospect.get("last_name"):
+        ln = f"https://linkedin.com/in/{prospect['first_name'].lower()}-{prospect['last_name'].lower()}"
+        await db.execute("UPDATE prospects SET linkedin_url=? WHERE id=?", (ln, prospect_id))
+        fields_updated.append("linkedin_url")
+    if fields_updated:
+        await db.commit()
+    updated = await get_prospect(db, prospect_id)
+    fields_after = {
+        "company": updated.get("company"),
+        "job_title": updated.get("job_title"),
+        "linkedin_url": updated.get("linkedin_url"),
+        "website": updated.get("website"),
+    }
+    status = "success" if fields_updated else "skipped"
+    now = _now()
+    r = await db.execute(
+        "INSERT INTO enrichment_log (prospect_id, source, fields_before, fields_after, fields_updated, status, created_at) VALUES (?,?,?,?,?,?,?)",
+        (prospect_id, source, jsonlib2.dumps(fields_before), jsonlib2.dumps(fields_after), jsonlib2.dumps(fields_updated), status, now),
+    )
+    await db.commit()
+    log_r = await db.execute("SELECT * FROM enrichment_log WHERE id=?", (r.lastrowid,))
+    return _enrichment_log_row(await log_r.fetchone())
+
+
+async def list_enrichment_log(db, prospect_id: int):
+    r = await db.execute("SELECT * FROM enrichment_log WHERE prospect_id=? ORDER BY created_at DESC", (prospect_id,))
+    return [_enrichment_log_row(row) for row in await r.fetchall()]
+
+
+async def bulk_enrich_prospects(db, prospect_ids: list):
+    total = len(prospect_ids)
+    enriched = 0
+    failed = 0
+    skipped = 0
+    for pid in prospect_ids[:100]:
+        try:
+            result = await enrich_prospect(db, pid)
+            if result is None:
+                failed += 1
+            elif result["status"] == "skipped":
+                skipped += 1
+            else:
+                enriched += 1
+        except Exception:
+            failed += 1
+    return {"total": total, "enriched": enriched, "failed": failed, "skipped": skipped}
+
+
+async def get_enrichment_stats(db):
+    import json as jsonlib3
+    r = await db.execute("SELECT COUNT(*) FROM enrichment_log")
+    total = (await r.fetchone())[0]
+    r2 = await db.execute("SELECT COUNT(*) FROM enrichment_log WHERE status='success'")
+    success = (await r2.fetchone())[0]
+    r3 = await db.execute("SELECT source, COUNT(*) as cnt FROM enrichment_log GROUP BY source")
+    by_source = {row["source"]: row["cnt"] for row in await r3.fetchall()}
+    r4 = await db.execute("SELECT fields_updated FROM enrichment_log WHERE status='success'")
+    field_counts = {}
+    for row in await r4.fetchall():
+        fields = jsonlib3.loads(row["fields_updated"]) if isinstance(row["fields_updated"], str) else row["fields_updated"]
+        for f in fields:
+            field_counts[f] = field_counts.get(f, 0) + 1
+    return {
+        "total_lookups": total,
+        "successful": success,
+        "success_rate": round(success / max(1, total) * 100, 1),
+        "by_source": by_source,
+        "top_fields": field_counts,
+    }
+
+
+# ── Reply Sentiment Analysis ─────────────────────────────────────────
+
+
+_SENTIMENT_KEYWORDS = {
+    "positive": ["interested", "love it", "great", "schedule", "demo", "yes", "excited", "perfect", "sounds good", "let's talk", "looking forward"],
+    "negative": ["not interested", "no thanks", "pass", "not a fit", "too expensive", "not now", "bad timing"],
+    "out_of_office": ["out of office", "vacation", "away", "return on", "ooo", "auto-reply", "out of the office"],
+    "unsubscribe": ["unsubscribe", "opt out", "remove me", "stop emailing", "do not contact", "take me off"],
+}
+
+
+async def analyze_reply(db, prospect_id: int, reply_text: str, sequence_id: int = None, draft_id: int = None):
+    import json as jsonlib4
+    text_lower = reply_text.lower()
+    matched = {}
+    for sentiment, keywords in _SENTIMENT_KEYWORDS.items():
+        hits = [kw for kw in keywords if kw in text_lower]
+        if hits:
+            matched[sentiment] = hits
+    if "unsubscribe" in matched:
+        sentiment = "unsubscribe"
+        key_phrases = matched["unsubscribe"]
+    elif "out_of_office" in matched:
+        sentiment = "out_of_office"
+        key_phrases = matched["out_of_office"]
+    elif "negative" in matched:
+        sentiment = "negative"
+        key_phrases = matched["negative"]
+    elif "positive" in matched:
+        sentiment = "positive"
+        key_phrases = matched["positive"]
+    else:
+        sentiment = "neutral"
+        key_phrases = []
+    total_hits = sum(len(v) for v in matched.values())
+    confidence = 0.9 if total_hits >= 2 else (0.7 if total_hits == 1 else 0.5)
+    auto_action = None
+    if sentiment == "unsubscribe":
+        prospect = await get_prospect(db, prospect_id)
+        if prospect and prospect.get("email"):
+            try:
+                await add_dnc(db, {"email": prospect["email"], "reason": "auto-unsubscribe from reply"})
+            except Exception:
+                pass
+        if sequence_id:
+            r = await db.execute(
+                "SELECT id FROM enrollments WHERE sequence_id=? AND prospect_id=? AND status='active'",
+                (sequence_id, prospect_id),
+            )
+            enrollment = await r.fetchone()
+            if enrollment:
+                await pause_enrollment(db, enrollment["id"])
+        auto_action = "added_to_dnc_and_paused"
+    elif sentiment == "positive":
+        if sequence_id:
+            try:
+                await record_event(db, {"prospect_id": prospect_id, "sequence_id": sequence_id, "draft_id": draft_id, "event_type": "replied"})
+            except Exception:
+                pass
+        auto_action = "recorded_reply_event"
+    now = _now()
+    r = await db.execute(
+        "INSERT INTO reply_analysis (prospect_id, sequence_id, draft_id, reply_text, sentiment, confidence, key_phrases, auto_action_taken, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (prospect_id, sequence_id, draft_id, reply_text, sentiment, confidence, jsonlib4.dumps(key_phrases), auto_action, now),
+    )
+    await db.commit()
+    log_r = await db.execute("SELECT * FROM reply_analysis WHERE id=?", (r.lastrowid,))
+    return _reply_analysis_row(await log_r.fetchone())
+
+
+async def list_replies(db, sentiment: str = None, prospect_id: int = None, sequence_id: int = None, limit: int = 50, offset: int = 0):
+    clauses, vals = [], []
+    if sentiment:
+        clauses.append("sentiment=?")
+        vals.append(sentiment)
+    if prospect_id:
+        clauses.append("prospect_id=?")
+        vals.append(prospect_id)
+    if sequence_id:
+        clauses.append("sequence_id=?")
+        vals.append(sequence_id)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    r = await db.execute(f"SELECT * FROM reply_analysis{where} ORDER BY created_at DESC LIMIT ? OFFSET ?", vals + [limit, offset])
+    return [_reply_analysis_row(row) for row in await r.fetchall()]
+
+
+async def get_reply(db, reply_id: int):
+    r = await db.execute("SELECT * FROM reply_analysis WHERE id=?", (reply_id,))
+    row = await r.fetchone()
+    return _reply_analysis_row(row) if row else None
+
+
+async def get_reply_analytics(db):
+    r = await db.execute("SELECT COUNT(*) FROM reply_analysis")
+    total = (await r.fetchone())[0]
+    r2 = await db.execute("SELECT sentiment, COUNT(*) as cnt FROM reply_analysis GROUP BY sentiment")
+    by_sentiment = {row["sentiment"]: row["cnt"] for row in await r2.fetchall()}
+    r3 = await db.execute("SELECT AVG(confidence) FROM reply_analysis")
+    avg_conf = (await r3.fetchone())[0] or 0.0
+    r4 = await db.execute("SELECT COUNT(*) FROM reply_analysis WHERE auto_action_taken IS NOT NULL")
+    auto_actions = (await r4.fetchone())[0]
+    return {
+        "total": total,
+        "by_sentiment": by_sentiment,
+        "avg_confidence": round(avg_conf, 2),
+        "auto_actions_taken": auto_actions,
+    }
+
+
+async def get_sequence_sentiment(db, sequence_id: int):
+    r = await db.execute("SELECT COUNT(*) FROM reply_analysis WHERE sequence_id=?", (sequence_id,))
+    total = (await r.fetchone())[0]
+    r2 = await db.execute("SELECT sentiment, COUNT(*) as cnt FROM reply_analysis WHERE sequence_id=? GROUP BY sentiment", (sequence_id,))
+    by_sentiment = {row["sentiment"]: row["cnt"] for row in await r2.fetchall()}
+    r3 = await db.execute("SELECT COUNT(*) FROM enrollments WHERE sequence_id=?", (sequence_id,))
+    enrollments_count = (await r3.fetchone())[0]
+    reply_rate = round(total / max(1, enrollments_count) * 100, 1)
+    return {
+        "sequence_id": sequence_id,
+        "total_replies": total,
+        "by_sentiment": by_sentiment,
+        "enrollments": enrollments_count,
+        "reply_rate": reply_rate,
+    }
